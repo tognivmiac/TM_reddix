@@ -27,6 +27,7 @@ pub trait FeedService: Send + Sync {
         sort: SortOption,
         opts: reddit::ListingOptions,
     ) -> Result<reddit::Listing<reddit::Post>>;
+    fn load_user_about(&self, name: &str) -> Result<reddit::UserAbout>;
     fn search_posts(
         &self,
         query: &str,
@@ -144,9 +145,26 @@ impl FeedService for RedditFeedService {
         sort: SortOption,
         opts: ListingOptions,
     ) -> Result<reddit::Listing<reddit::Post>> {
-        self.client
-            .user_listing(name, sort, opts)
-            .context("fetch user submissions")
+        match self.client.user_listing(name, sort, opts.clone()) {
+            // `/user/<name>/submitted` needs the `history` OAuth scope. Tokens
+            // issued without it get 403, so fall back to an author search,
+            // which only needs `read`.
+            Err(err) if reddit::is_forbidden(&err) => {
+                let search_sort = match sort {
+                    SortOption::Hot | SortOption::Top | SortOption::New => sort,
+                    SortOption::Best | SortOption::Rising => SortOption::New,
+                };
+                let user = name.trim().trim_start_matches("u/");
+                self.client
+                    .search_posts(&format!("author:{user}"), search_sort, opts)
+                    .context("search user submissions")
+            }
+            other => other.context("fetch user submissions"),
+        }
+    }
+
+    fn load_user_about(&self, name: &str) -> Result<reddit::UserAbout> {
+        self.client.user_about(name).context("fetch user profile")
     }
 
     fn search_posts(
@@ -280,6 +298,13 @@ impl FeedService for MockFeedService {
         _opts: reddit::ListingOptions,
     ) -> Result<reddit::Listing<reddit::Post>> {
         Ok(mock_listing(&format!("User posts for u/{name}")))
+    }
+
+    fn load_user_about(&self, name: &str) -> Result<reddit::UserAbout> {
+        Ok(reddit::UserAbout {
+            name: name.to_string(),
+            ..Default::default()
+        })
     }
 
     fn search_posts(

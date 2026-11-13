@@ -19,7 +19,7 @@ fn handle_cli_flags() -> bool {
             }
             "--help" | "-h" => {
                 println!(
-                    "Reddix — Reddit, refined for the terminal.\n\n  --version, -V        Show version and exit\n  --help,    -h        Show this help message\n  --check-updates      Check for updates and exit"
+                    "Reddix — Reddit, refined for the terminal.\n\nUsage: redx [FLAG]\n\n  --version, -V        Show version and exit\n  --help,    -h        Show this help message\n  --check-updates      Check for updates and exit"
                 );
                 saw_flag = true;
             }

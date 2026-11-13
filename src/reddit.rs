@@ -104,6 +104,14 @@ impl CommentSortOption {
     }
 }
 
+const FORBIDDEN_MESSAGE: &str = "reddit: forbidden";
+
+/// True when `err` is the client's 403 response (missing scope or access).
+pub fn is_forbidden(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.to_string() == FORBIDDEN_MESSAGE)
+}
+
 fn sanitize_username(raw: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -199,6 +207,15 @@ impl Client {
         let path = format!("/user/{}/submitted.json", normalized);
         opts.extra.push(("sort".into(), sort.as_str().to_string()));
         self.fetch_listing(&path, opts)
+    }
+
+    /// Profile summary for a user (karma, account age).
+    pub fn user_about(&self, username: &str) -> Result<UserAbout> {
+        let normalized = sanitize_username(username)?;
+        let path = format!("/user/{}/about.json", normalized);
+        let resp = self.request(Method::GET, &path, &[], None)?;
+        let thing: Thing<UserAbout> = resp.json()?;
+        Ok(thing.data)
     }
 
     pub fn search_posts(
@@ -407,7 +424,7 @@ impl Client {
             let body = resp.text().unwrap_or_default();
             match status.as_u16() {
                 401 => Err(anyhow!("reddit: unauthorized")),
-                403 => Err(anyhow!("reddit: forbidden")),
+                403 => Err(anyhow!(FORBIDDEN_MESSAGE)),
                 429 => Err(anyhow!("reddit: rate limited: {}", body)),
                 _ => Err(anyhow!("reddit: api error {}: {}", status, body)),
             }
@@ -448,6 +465,24 @@ pub struct Listing<T> {
 pub struct Thing<T> {
     pub kind: String,
     pub data: T,
+}
+
+/// Subset of `/user/<name>/about`. Suspended accounts only return `name` and
+/// `is_suspended`, so everything else defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UserAbout {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub link_karma: i64,
+    #[serde(default)]
+    pub comment_karma: i64,
+    #[serde(default)]
+    pub total_karma: i64,
+    #[serde(default)]
+    pub created_utc: f64,
+    #[serde(default)]
+    pub is_suspended: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

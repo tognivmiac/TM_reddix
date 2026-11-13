@@ -5,11 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+- Nothing yet.
+
+## [0.2.9+tm.20261113] - 2026-11-13
+Personal fork build on top of upstream 0.2.9. Fork builds keep the upstream base version and append `+tm.<YYYYMMDD>`, the build date in UTC.
 ### Added
+- User pages: press `a` (or use the actions menu) to open the page of the selected post's or comment's author. The actions menu entry "Go to author or subreddit…" lets you pick between the author's page and the post's subreddit. The posts pane title shows their post/comment karma and account age.
+- `/` opens a search prompt from any pane; Enter searches Reddit for what you typed.
+- `Ctrl+V` opens the post author's page from the posts or content pane.
+- Mouse: clicking a pane focuses it, and the wheel scrolls the pane under the pointer.
+- Inline video starts muted; press `v` while it plays to toggle sound.
+- `Ctrl+A` jumps back to the home feed Reddix starts on (`r/frontpage`).
+- `history` is now part of the default OAuth scopes. User pages need it for the full submission list; tokens without it fall back to an author search.
 - Vim-style paging: `Ctrl+D`/`Ctrl+U` move half a page and `Ctrl+F`/`Ctrl+B` a full page in every pane.
 ### Changed
 - `PageUp`/`PageDown`/`Space` now move by what actually fits in the focused pane instead of a fixed step.
+- The mouse wheel no longer moves the selection of the focused pane; it scrolls the pane under the pointer and leaves focus and selection alone. The next key press or click snaps the view back to the selection.
+- The command is now `redx` instead of `reddix`. Config, state and cache directories keep the `reddix` name, so existing settings and logins carry over.
+- The update check no longer looks at upstream GitHub releases. "Latest" now means the version in the local source checkout the binary was built from (override with `REDDIX_SOURCE_DIR`), and `Shift+U` rebuilds from that checkout and replaces the running binary.
 ### Fixed
+- Inline video no longer dies on mpv builds without Lua: `--ytdl=no` and `--osc=no` are only passed when the installed mpv knows those options. A player that exits with an error is no longer relaunched in a loop.
+- PNG posts now show inline previews. Reddit serves PNG previews as palette-indexed files, which were passed to the terminal untouched; every preview is now re-encoded as plain RGB/RGBA PNG first.
 - Feed, subreddit, and subscription requests no longer fail with `403 Forbidden`; the HTTP client now negotiates HTTP/2.
 
 ## [0.2.9] - 2025-11-05

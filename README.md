@@ -48,12 +48,12 @@ yay -S reddix-bin
 ## Quickstart
 
 1. Apply for a Reddit “script” via the [Reddit support form](https://support.reddithelp.com/hc/en-us/requests/new?ticket_form_id=14868593862164&tf_14867328473236=api_request_type_enterprise). Once approved, set the redirect URI to `http://127.0.0.1:65010/reddix/callback`.
-2. Launch `reddix`, press `m`, and follow the guided menu for setup.
+2. Launch `redx`, press `m`, and follow the guided menu for setup.
 3. Prefer to configure things manually? Copy [`docs/examples/config.yaml`](docs/examples/config.yaml) into `~/.config/reddix/config.yaml` and fill in your credentials.
 
 Note: As of Nov 2025, Reddit blocked the old `reddit.com/prefs/apps` flow. Apply via the [Reddit support form](https://support.reddithelp.com/hc/en-us/requests/new?ticket_form_id=14868593862164&tf_14867328473236=api_request_type_enterprise) (context: https://www.reddit.com/r/redditdev/comments/1oug31u/introducing_the_responsible_builder_policy_new/).
 
-Core shortcuts: `j/k` move, `Ctrl+d`/`Ctrl+u` half page, `Ctrl+f`/`Ctrl+b` (or `PgDn`/`PgUp`) full page, `h/l` change panes, `m` guided menu, `o` action menu, `r` refresh, `s` sync subs, `u/d` vote, `q` quit.
+Core shortcuts: `j/k` move, `Ctrl+d`/`Ctrl+u` half page, `Ctrl+f`/`Ctrl+b` (or `PgDn`/`PgUp`) full page, `h/l` change panes, `/` search, `a`/`Ctrl+v` author's user page, `Ctrl+a` back to the home feed, `m` guided menu, `o` action menu, `r` refresh, `s` sync subs, `u/d` vote, `v` unmute inline video, `q` quit.
 
 ## Support
 

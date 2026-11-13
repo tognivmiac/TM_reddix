@@ -16,5 +16,7 @@ pub mod update;
 pub mod video;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Name of the installed command (see `[[bin]]` in Cargo.toml).
+pub const BIN_NAME: &str = "redx";
 
 pub use app::run;

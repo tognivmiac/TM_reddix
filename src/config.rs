@@ -59,6 +59,8 @@ fn default_scopes() -> Vec<String> {
         "vote".into(),
         "submit".into(),
         "subscribe".into(),
+        // Needed for /user/<name>/submitted (user pages).
+        "history".into(),
     ]
 }
 

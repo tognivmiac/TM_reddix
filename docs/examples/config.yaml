@@ -11,6 +11,7 @@ reddit:
     - read
     - vote
     - subscribe
+    - history
   redirect_uri: "http://127.0.0.1:65010/reddix/callback"
 ui:
   theme: default

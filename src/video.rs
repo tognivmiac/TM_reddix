@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -115,6 +115,52 @@ fn some_positive(value: i64) -> Option<i64> {
 
 fn sanitize_url(raw: &str) -> String {
     raw.trim().replace("&amp;", "&")
+}
+
+/// Parses `mpv --list-options` output into the set of option names.
+fn parse_option_names(listing: &str) -> std::collections::HashSet<String> {
+    listing
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("--"))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Options the given mpv build accepts, probed once per binary. `None` when
+/// the probe fails, in which case every option is assumed to exist.
+fn mpv_options(mpv_path: &str) -> Option<std::collections::HashSet<String>> {
+    static CACHE: OnceLock<
+        Mutex<std::collections::HashMap<String, Option<std::collections::HashSet<String>>>>,
+    > = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache
+        .entry(mpv_path.to_string())
+        .or_insert_with(|| {
+            let output = Command::new(mpv_path)
+                .args(["--no-config", "--list-options"])
+                .stdin(Stdio::null())
+                .output()
+                .ok()?;
+            let names = parse_option_names(&String::from_utf8_lossy(&output.stdout));
+            (!names.is_empty()).then_some(names)
+        })
+        .clone()
+}
+
+/// Adds `arg` only when this mpv build knows `option`. `--ytdl` and `--osc`
+/// come from mpv's Lua scripts; builds without Lua reject them as unknown
+/// options and exit immediately, which left video previews blank.
+fn push_if_supported(args: &mut Vec<String>, mpv_path: &str, option: &str, arg: &str) {
+    let supported = mpv_options(mpv_path).is_none_or(|names| names.contains(option));
+    if supported {
+        args.push(arg.to_string());
+    } else {
+        debug_log(format!("mpv lacks --{option}; skipping {arg}"));
+    }
 }
 
 fn push_http_headers(args: &mut Vec<String>) {
@@ -301,8 +347,10 @@ pub fn spawn_inline_player(opts: InlineLaunchOptions<'_>) -> Result<InlineSessio
             args.push("--terminal=no".to_string());
             args.push("--input-terminal=no".to_string());
             args.push("--no-config".to_string());
-            args.push("--ytdl=no".to_string());
-            args.push("--osc=no".to_string());
+            // Inline previews start on their own, so they stay silent.
+            args.push("--mute=yes".to_string());
+            push_if_supported(&mut args, &mpv_path, "ytdl", "--ytdl=no");
+            push_if_supported(&mut args, &mpv_path, "osc", "--osc=no");
             args.push("--osd-level=0".to_string());
             args.push("--osd-duration=0".to_string());
             if let Some(arg) = &ipc_arg {
@@ -431,7 +479,7 @@ pub fn spawn_external_player(opts: ExternalLaunchOptions<'_>) -> Result<()> {
     args.push("--loop-file=inf".to_string());
     args.push("--really-quiet".to_string());
     args.push("--no-config".to_string());
-    args.push("--ytdl=no".to_string());
+    push_if_supported(&mut args, opts.mpv_path, "ytdl", "--ytdl=no");
 
     push_http_headers(&mut args);
 
@@ -455,6 +503,7 @@ pub fn spawn_external_player(opts: ExternalLaunchOptions<'_>) -> Result<()> {
 #[derive(Clone, Copy)]
 pub enum VideoCommand {
     TogglePause,
+    ToggleMute,
     SeekRelative(f64),
 }
 
@@ -564,6 +613,7 @@ fn cleanup_ipc_path(_path: &str) {}
 fn command_payload(command: VideoCommand) -> serde_json::Value {
     match command {
         VideoCommand::TogglePause => json!(["cycle", "pause"]),
+        VideoCommand::ToggleMute => json!(["cycle", "mute"]),
         VideoCommand::SeekRelative(offset) => json!(["seek", offset, "relative"]),
     }
 }
@@ -636,5 +686,15 @@ mod tests {
             ..RedditVideo::default()
         };
         assert!(VideoSource::from_reddit_video(&video, Cow::Borrowed("Sample title")).is_none());
+    }
+
+    #[test]
+    fn parses_mpv_option_listing() {
+        let listing = "Options:\n\n --ab-loop-a                      Time (default: no)\n --mute                           Flag (default: no)\n --vo                             Object settings list\n\nTotal: 3 options\n";
+        let names = parse_option_names(listing);
+        assert!(names.contains("mute"));
+        assert!(names.contains("vo"));
+        assert!(!names.contains("ytdl"));
+        assert_eq!(names.len(), 3);
     }
 }

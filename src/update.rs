@@ -1,42 +1,42 @@
+//! Update check for this personal fork.
+//!
+//! "Latest" means the version declared by the local source checkout this
+//! binary was built from, not an upstream GitHub release. When the checkout's
+//! `Cargo.toml` is ahead of the running binary, the updater rebuilds from that
+//! checkout and replaces the running executable. Nothing is fetched from the
+//! network.
+
 use std::env;
-#[cfg(unix)]
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
-use reqwest::blocking::Client;
-use reqwest::StatusCode;
+use anyhow::{anyhow, bail, Context, Result};
 use semver::Version;
-use serde::Deserialize;
-use tempfile::Builder as TempFileBuilder;
-
-#[cfg(target_os = "windows")]
-const INSTALLER_NAME: &str = "reddix-installer.ps1";
-#[cfg(not(target_os = "windows"))]
-const INSTALLER_NAME: &str = "reddix-installer.sh";
 
 pub const SKIP_UPDATE_ENV: &str = "REDDIX_SKIP_UPDATE_CHECK";
+/// Overrides the source checkout used for update checks and rebuilds.
+pub const SOURCE_DIR_ENV: &str = "REDDIX_SOURCE_DIR";
 
-const RELEASES_URL: &str = "https://api.github.com/repos/ck-zhang/reddix/releases/latest";
+/// The checkout this binary was compiled from.
+const BUILD_SOURCE_DIR: &str = env!("CARGO_MANIFEST_DIR");
 const FORCE_VERSION_ENV: &str = "REDDIX_FORCE_UPDATE_VERSION";
 const FORCE_URL_ENV: &str = "REDDIX_FORCE_UPDATE_URL";
 
 #[derive(Debug, Clone)]
 pub struct UpdateInfo {
     pub version: Version,
+    /// Where the newer version lives: the local source checkout.
     pub release_url: String,
     pub tag: String,
 }
 
-#[derive(Deserialize)]
-struct Release {
-    tag_name: String,
-    html_url: String,
-    draft: bool,
-    prerelease: bool,
+/// Source checkout that defines the latest version of this fork.
+pub fn source_dir() -> PathBuf {
+    env::var_os(SOURCE_DIR_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(BUILD_SOURCE_DIR))
 }
 
 pub fn check_for_update(current: &Version) -> Result<Option<UpdateInfo>> {
@@ -44,58 +44,53 @@ pub fn check_for_update(current: &Version) -> Result<Option<UpdateInfo>> {
         return Ok(Some(update));
     }
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(8))
-        .user_agent(format!(
-            "reddix/{version} (update-check)",
-            version = crate::VERSION
-        ))
-        .build()
-        .context("build update HTTP client")?;
-
-    let response = client
-        .get(RELEASES_URL)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .context("request latest release metadata")?;
-
-    if response.status() == StatusCode::NOT_FOUND {
+    let dir = source_dir();
+    let manifest = dir.join("Cargo.toml");
+    if !manifest.is_file() {
+        // The checkout was moved or removed; there is nothing to compare with.
         return Ok(None);
     }
 
-    if response.status() == StatusCode::FORBIDDEN {
-        bail!("rate limited by GitHub while checking for updates");
-    }
-
-    if !response.status().is_success() {
-        bail!("update check failed with status {}", response.status());
-    }
-
-    let release: Release = response
-        .json()
-        .context("decode release response from GitHub")?;
-
-    if release.draft || release.prerelease {
-        return Ok(None);
-    }
-
-    let tag = release.tag_name.trim();
-    let normalized = tag
-        .strip_prefix('v')
-        .or_else(|| tag.strip_prefix('V'))
-        .unwrap_or(tag);
-    let version = Version::parse(normalized)
-        .with_context(|| format!("parse release tag {tag:?} as semantic version"))?;
+    let text =
+        fs::read_to_string(&manifest).with_context(|| format!("read {}", manifest.display()))?;
+    let version = manifest_version(&text)
+        .with_context(|| format!("read package version from {}", manifest.display()))?;
 
     if &version > current {
         Ok(Some(UpdateInfo {
+            tag: format!("v{version}"),
             version,
-            release_url: release.html_url,
-            tag: tag.to_string(),
+            release_url: dir.display().to_string(),
         }))
     } else {
         Ok(None)
     }
+}
+
+/// Extracts `version` from the `[package]` table of a Cargo manifest.
+fn manifest_version(manifest: &str) -> Result<Version> {
+    let mut in_package = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "version" {
+            continue;
+        }
+        let value = value.split('#').next().unwrap_or_default().trim();
+        let value = value.trim_matches(|ch| ch == '"' || ch == '\'');
+        return Version::parse(value)
+            .with_context(|| format!("parse {value:?} as semantic version"));
+    }
+    Err(anyhow!("no [package] version found"))
 }
 
 fn forced_update(current: &Version) -> Result<Option<UpdateInfo>> {
@@ -123,7 +118,7 @@ fn forced_update(current: &Version) -> Result<Option<UpdateInfo>> {
         .ok()
         .map(|raw| raw.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| format!("https://github.com/ck-zhang/reddix/releases/tag/v{version}"));
+        .unwrap_or_else(|| source_dir().display().to_string());
     let tag = format!("v{version}");
 
     Ok(Some(UpdateInfo {
@@ -133,116 +128,69 @@ fn forced_update(current: &Version) -> Result<Option<UpdateInfo>> {
     }))
 }
 
-impl UpdateInfo {
-    pub fn assets_base_url(&self) -> String {
-        release_download_base(&self.release_url, &self.tag)
+/// Rebuilds from the local source checkout and replaces the running binary.
+pub fn install_update(_info: &UpdateInfo) -> Result<()> {
+    let dir = source_dir();
+    let output = Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(&dir)
+        .output()
+        .with_context(|| format!("run cargo build --release in {}", dir.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail: Vec<&str> = stderr.lines().rev().take(5).collect();
+        let tail: Vec<&str> = tail.into_iter().rev().collect();
+        bail!(
+            "cargo build exited with status {}: {}",
+            output.status,
+            tail.join(" | ")
+        );
     }
 
-    pub fn installer_url(&self) -> String {
-        format!("{}/{}", self.assets_base_url(), INSTALLER_NAME)
+    let built = dir.join("target").join("release").join(format!(
+        "{}{}",
+        crate::BIN_NAME,
+        env::consts::EXE_SUFFIX
+    ));
+    if !built.is_file() {
+        bail!("built binary not found at {}", built.display());
     }
+
+    let current = env::current_exe().context("locate the running executable")?;
+    // Resolve symlinks (e.g. a Homebrew bin link) so the real file is replaced.
+    let target = fs::canonicalize(&current).unwrap_or(current);
+    if fs::canonicalize(&built).ok().as_deref() == Some(target.as_path()) {
+        // Running straight out of target/release: the build already updated it.
+        return Ok(());
+    }
+    replace_executable(&built, &target)
 }
 
-fn release_download_base(release_url: &str, tag: &str) -> String {
-    if let Some(idx) = release_url.find("/releases/tag/") {
-        let prefix = &release_url[..idx];
-        format!("{}/releases/download/{}", prefix.trim_end_matches('/'), tag)
-    } else {
-        format!(
-            "https://github.com/ck-zhang/reddix/releases/download/{}",
-            tag
-        )
-    }
-}
-
-pub fn install_update(info: &UpdateInfo) -> Result<()> {
-    let installer_url = info.installer_url();
-
-    let client = Client::builder()
-        .timeout(Duration::from_secs(60))
-        .user_agent(format!(
-            "reddix/{version} (update-install)",
-            version = crate::VERSION
-        ))
-        .build()
-        .context("build HTTP client for installer download")?;
-
-    let mut response = client
-        .get(&installer_url)
-        .send()
-        .with_context(|| format!("download installer from {installer_url}"))?
-        .error_for_status()
-        .with_context(|| format!("installer request returned error for {installer_url}"))?;
-
-    let suffix = if cfg!(target_os = "windows") {
-        ".ps1"
-    } else {
-        ".sh"
-    };
-    let mut temp = TempFileBuilder::new()
-        .prefix("reddix-installer-")
-        .suffix(suffix)
-        .tempfile()
-        .context("create temporary file for installer")?;
-
-    response
-        .copy_to(temp.as_file_mut())
-        .context("write installer to temporary file")?;
-    temp.as_file_mut()
-        .flush()
-        .context("flush installer to disk")?;
+/// Copies `built` next to `target` and renames it into place, so the running
+/// binary is swapped atomically and never left half-written.
+fn replace_executable(built: &Path, target: &Path) -> Result<()> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent directory", target.display()))?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(".reddix-update-")
+        .tempfile_in(parent)
+        .with_context(|| format!("create staging file in {}", parent.display()))?;
+    let mut source = fs::File::open(built).with_context(|| format!("open {}", built.display()))?;
+    std::io::copy(&mut source, staged.as_file_mut())
+        .with_context(|| format!("copy {} into place", built.display()))?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755))
-            .context("mark installer as executable")?;
+        fs::set_permissions(staged.path(), fs::Permissions::from_mode(0o755))
+            .context("mark the new binary as executable")?;
     }
 
-    let temp_path: PathBuf = temp.path().to_path_buf();
-    run_installer(&temp_path)?;
-    temp.close().context("remove temporary installer file")?;
+    staged
+        .persist(target)
+        .with_context(|| format!("replace {}", target.display()))?;
     Ok(())
-}
-
-fn run_installer(path: &Path) -> Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        let output = Command::new("powershell")
-            .arg("-NoProfile")
-            .arg("-ExecutionPolicy")
-            .arg("Bypass")
-            .arg("-File")
-            .arg(path)
-            .output()
-            .context("run reddix PowerShell installer")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!(
-                "installer exited with status {}: {}",
-                output.status,
-                stderr.trim()
-            );
-        }
-        return Ok(());
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let output = Command::new("sh")
-            .arg(path)
-            .output()
-            .context("run reddix installer script")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!(
-                "installer exited with status {}: {}",
-                output.status,
-                stderr.trim()
-            );
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -276,5 +224,59 @@ mod tests {
         let current = Version::parse("0.1.0").unwrap();
         assert!(forced_update(&current).unwrap().is_none());
         env::remove_var(FORCE_VERSION_ENV);
+    }
+
+    #[test]
+    fn manifest_version_reads_package_table_only() {
+        let manifest = r#"
+[workspace.package]
+version = "9.9.9"
+
+[package]
+name = "reddix"
+version = "0.2.9+tm.2" # fork build
+
+[dependencies]
+version = "1.0.0"
+"#;
+        assert_eq!(
+            manifest_version(manifest).unwrap(),
+            Version::parse("0.2.9+tm.2").unwrap()
+        );
+        assert!(manifest_version("[dependencies]\nversion = \"1.0.0\"\n").is_err());
+    }
+
+    #[test]
+    fn fork_suffix_orders_builds() {
+        let parse = |raw: &str| Version::parse(raw).unwrap();
+        assert!(parse("0.2.9+tm.2") > parse("0.2.9+tm.1"));
+        assert!(parse("0.2.9+tm.10") > parse("0.2.9+tm.9"));
+        assert!(parse("0.2.9+tm.1") > parse("0.2.9"));
+        assert!(parse("0.2.10") > parse("0.2.9+tm.5"));
+    }
+
+    #[test]
+    fn check_compares_against_source_checkout() {
+        let _guard = guard_env();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"reddix\"\nversion = \"0.2.9+tm.2\"\n",
+        )
+        .unwrap();
+        env::set_var(SOURCE_DIR_ENV, dir.path());
+
+        let older = Version::parse("0.2.9+tm.1").unwrap();
+        let info = check_for_update(&older).unwrap().unwrap();
+        assert_eq!(info.version, Version::parse("0.2.9+tm.2").unwrap());
+        assert_eq!(info.release_url, dir.path().display().to_string());
+
+        let same = Version::parse("0.2.9+tm.2").unwrap();
+        assert!(check_for_update(&same).unwrap().is_none());
+
+        // A missing checkout is not an error; there is just nothing newer.
+        env::set_var(SOURCE_DIR_ENV, dir.path().join("missing"));
+        assert!(check_for_update(&older).unwrap().is_none());
+        env::remove_var(SOURCE_DIR_ENV);
     }
 }

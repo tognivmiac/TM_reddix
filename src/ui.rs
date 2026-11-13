@@ -23,7 +23,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use crossterm::cursor::MoveTo;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEvent, MouseEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::style::Print;
 use crossterm::terminal::{
@@ -83,6 +83,7 @@ const CURRENT_VERSION_OVERRIDE_ENV: &str = "REDDIX_OVERRIDE_CURRENT_VERSION";
 const REDDIX_COMMUNITY: &str = "ReddixTUI";
 const REDDIX_COMMUNITY_DISPLAY: &str = "r/ReddixTUI";
 const MPV_PATH_ENV: &str = "REDDIX_MPV_PATH";
+const VIDEO_DEBUG_HINT: &str = "REDDIX_DEBUG_VIDEO=1 REDDIX_DEBUG_VIDEO_LOG=<file>";
 
 fn vote_from_likes(likes: Option<bool>) -> i32 {
     match likes {
@@ -204,6 +205,11 @@ struct NavigationMenuState {
     matches: Vec<NavigationMatch>,
     editing: bool,
     selected: usize,
+    /// Opened with `/`: the "Search Reddit" entry is listed first, so Enter
+    /// runs a search instead of opening a subreddit with the typed name.
+    search_first: bool,
+    /// Fixed choices shown while nothing is typed (the "Go to…" chooser).
+    preset: Vec<NavigationMatch>,
 }
 
 #[derive(Clone)]
@@ -228,6 +234,7 @@ enum ActionMenuAction {
     StopVideo,
     OpenVideoExternal,
     OpenNavigation,
+    GoTo,
     ToggleFullscreen,
     ComposeComment,
     GalleryPrevious,
@@ -270,12 +277,19 @@ impl NavigationMatch {
 }
 
 impl NavigationMenuState {
-    fn new(filter: String, matches: Vec<NavigationMatch>, editing: bool) -> Self {
+    fn new(
+        filter: String,
+        matches: Vec<NavigationMatch>,
+        editing: bool,
+        search_first: bool,
+    ) -> Self {
         let mut state = Self {
             filter,
             matches,
             editing,
             selected: 0,
+            search_first,
+            preset: Vec::new(),
         };
         state.ensure_selection();
         state
@@ -1421,6 +1435,10 @@ enum VoteTarget {
 }
 
 enum AsyncResponse {
+    UserProfile {
+        name: String,
+        result: Result<reddit::UserAbout>,
+    },
     Posts {
         request_id: u64,
         target: String,
@@ -1494,6 +1512,89 @@ enum AsyncResponse {
         previous: i32,
         error: Option<String>,
     },
+}
+
+/// Lines the content pane moves per mouse wheel notch.
+const WHEEL_CONTENT_LINES: u16 = 3;
+
+/// Which list panes are currently scrolled independently of their selection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FreeScroll {
+    navigation: bool,
+    posts: bool,
+    comments: bool,
+}
+
+/// Pane whose drawn area contains the given terminal cell.
+fn pane_at(areas: &[(Pane, Rect)], column: u16, row: u16) -> Option<Pane> {
+    areas
+        .iter()
+        .find(|(_, area)| {
+            column >= area.x
+                && column < area.x.saturating_add(area.width)
+                && row >= area.y
+                && row < area.y.saturating_add(area.height)
+        })
+        .map(|(pane, _)| *pane)
+}
+
+/// The feed selected at startup.
+const HOME_FEED: &str = "r/frontpage";
+
+/// False for the placeholders Reddit uses when an account is gone.
+fn is_real_author(author: &str) -> bool {
+    let author = author.trim();
+    !author.is_empty() && author != "[deleted]" && author != "[removed]"
+}
+
+/// Compact count for tight spaces: `950`, `3.2k`, `757k`, `1.2M`.
+fn compact_count(value: i64) -> String {
+    let sign = if value < 0 { "-" } else { "" };
+    let magnitude = value.unsigned_abs();
+    let scaled = |divisor: u64, suffix: &str| {
+        let tenths = magnitude * 10 / divisor;
+        if tenths < 100 && !tenths.is_multiple_of(10) {
+            format!("{sign}{}.{}{suffix}", tenths / 10, tenths % 10)
+        } else {
+            format!("{sign}{}{suffix}", tenths / 10)
+        }
+    };
+    match magnitude {
+        0..=999 => format!("{sign}{magnitude}"),
+        1_000..=999_999 => scaled(1_000, "k"),
+        _ => scaled(1_000_000, "M"),
+    }
+}
+
+/// Account age as `5y`, `8mo` or `12d`.
+fn compact_age(created_utc: i64, now_utc: i64) -> String {
+    let days = now_utc.saturating_sub(created_utc).max(0) / 86_400;
+    if days >= 365 {
+        format!("{}y", days / 365)
+    } else if days >= 30 {
+        format!("{}mo", days / 30)
+    } else {
+        format!("{days}d")
+    }
+}
+
+/// One-line profile summary shown in the posts pane title on a user page:
+/// `u/name · <post>/<comment> karma · <account age>`. Kept short because the
+/// pane title is narrow.
+fn user_profile_summary(user: &str, profile: &reddit::UserAbout, now_utc: i64) -> String {
+    if profile.is_suspended {
+        return format!("u/{user} · suspended");
+    }
+    let mut summary = format!(
+        "u/{user} · {}/{} karma",
+        compact_count(profile.link_karma),
+        compact_count(profile.comment_karma)
+    );
+    if profile.created_utc > 0.0 {
+        summary.push_str(" · ");
+        summary.push_str(&compact_age(profile.created_utc as i64, now_utc));
+    }
+    summary
 }
 
 /// How far a paging key (Ctrl+D/U, Ctrl+F/B, PageUp/PageDown) moves.
@@ -2463,21 +2564,29 @@ fn fetch_image_bytes(url: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn encode_png_for_kitty(bytes: &[u8]) -> Result<Cow<'_, [u8]>> {
+/// Re-encodes any supported image as a plain 8-bit RGB/RGBA PNG for the kitty
+/// graphics protocol.
+///
+/// PNG input is normalized too rather than passed through: Reddit serves PNG
+/// previews as palette-indexed files, and terminals implementing the kitty
+/// protocol do not all decode indexed (or 16-bit) PNGs, which left those posts
+/// without a preview while JPEG posts rendered fine.
+fn encode_png_for_kitty(bytes: &[u8]) -> Result<Vec<u8>> {
     if bytes.is_empty() {
         bail!("preview image had no bytes");
     }
 
-    if matches!(image::guess_format(bytes), Ok(ImageFormat::Png)) {
-        return Ok(Cow::Borrowed(bytes));
-    }
-
     let image = image::load_from_memory(bytes).context("decode preview image")?;
+    let image = if image.color().has_alpha() {
+        image::DynamicImage::ImageRgba8(image.to_rgba8())
+    } else {
+        image::DynamicImage::ImageRgb8(image.to_rgb8())
+    };
     let mut png_bytes = Vec::new();
     image
         .write_to(&mut Cursor::new(&mut png_bytes), ImageFormat::Png)
         .context("encode preview as png")?;
-    Ok(Cow::Owned(png_bytes))
+    Ok(png_bytes)
 }
 
 fn tmux_passthrough_enabled() -> bool {
@@ -2493,7 +2602,7 @@ fn kitty_transmit_inline(bytes: &[u8], cols: i32, rows: i32, image_id: u32) -> R
 
     let cols = cols.max(1);
     let rows = rows.max(1);
-    let encoded = general_purpose::STANDARD.encode(png_data.as_ref());
+    let encoded = general_purpose::STANDARD.encode(&png_data);
     if encoded.is_empty() {
         bail!("failed to encode image preview");
     }
@@ -3595,6 +3704,14 @@ pub struct Model {
     media_handle: Option<media::Handle>,
     media_constraints: MediaConstraints,
     video_completed_post: Option<String>,
+    /// Screen areas of the panes drawn in the last frame, for mouse hit tests.
+    pane_areas: Vec<(Pane, Rect)>,
+    /// Panes whose list was scrolled with the mouse wheel. Their viewport
+    /// stops following the selection until the next key press or click.
+    free_scroll: FreeScroll,
+    /// Post whose inline player exited with an error; it is not auto-started
+    /// again until the selection changes or playback is restarted by hand.
+    video_failed_post: Option<String>,
     terminal_cols: u16,
     terminal_rows: u16,
     media_fullscreen: bool,
@@ -3672,6 +3789,10 @@ pub struct Model {
     response_rx: Receiver<AsyncResponse>,
     next_request_id: u64,
     pending_posts: Option<PendingPosts>,
+    /// Profile summaries for user pages, keyed by lowercase username.
+    user_profiles: HashMap<String, reddit::UserAbout>,
+    /// Usernames whose profile request is still in flight.
+    pending_user_profiles: HashSet<String>,
     pending_comments: Option<PendingComments>,
     pending_comment_submit: Option<PendingCommentSubmit>,
     pending_subreddits: Option<PendingSubreddits>,
@@ -4517,6 +4638,9 @@ impl Model {
             pending_video_clear: None,
             pending_external_video: None,
             video_completed_post: None,
+            pane_areas: Vec::new(),
+            free_scroll: FreeScroll::default(),
+            video_failed_post: None,
             media_save_in_progress: None,
             media_layouts: HashMap::new(),
             media_handle: opts.media_handle.clone(),
@@ -4601,6 +4725,8 @@ impl Model {
             response_rx,
             next_request_id: 1,
             pending_posts: None,
+            user_profiles: HashMap::new(),
+            pending_user_profiles: HashSet::new(),
             pending_comments: None,
             pending_comment_submit: None,
             pending_subreddits: None,
@@ -4626,7 +4752,7 @@ impl Model {
         model.selected_sub = model
             .subreddits
             .iter()
-            .position(|name| name.eq_ignore_ascii_case("r/frontpage"))
+            .position(|name| name.eq_ignore_ascii_case(HOME_FEED))
             .unwrap_or(0);
         model.selected_post = 0;
         model.selected_comment = 0;
@@ -4859,6 +4985,8 @@ impl Model {
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         let code = key.code;
+        // Keyboard input goes back to the selection: drop any wheel scrolling.
+        self.free_scroll = FreeScroll::default();
 
         if self.active_video.is_some() && matches!(code, KeyCode::Esc) {
             let stopped = self.stop_active_video(Some("Video preview stopped."), false);
@@ -4916,6 +5044,19 @@ impl Model {
                 self.mark_dirty();
                 return Ok(false);
             }
+            if matches!(code, KeyCode::Char('a') | KeyCode::Char('A')) {
+                self.go_home()?;
+                self.mark_dirty();
+                return Ok(false);
+            }
+            if matches!(code, KeyCode::Char('v') | KeyCode::Char('V')) {
+                // Post author's page, from the panes that show the post.
+                if matches!(self.focused_pane, Pane::Posts | Pane::Content) {
+                    self.open_author_page()?;
+                    self.mark_dirty();
+                }
+                return Ok(false);
+            }
         }
 
         match code {
@@ -4930,6 +5071,10 @@ impl Model {
             }
             KeyCode::Char('g') | KeyCode::Char('G') => {
                 self.open_navigation_mode(String::new(), true);
+                return Ok(false);
+            }
+            KeyCode::Char('/') => {
+                self.open_search();
                 return Ok(false);
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
@@ -4964,6 +5109,10 @@ impl Model {
             KeyCode::Char('o') | KeyCode::Char('O') => {
                 self.open_action_menu();
                 return Ok(false);
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                self.open_author_page()?;
+                dirty = true;
             }
             KeyCode::Char('n') | KeyCode::Char('N') => {
                 self.toggle_nsfw_filter()?;
@@ -5230,6 +5379,10 @@ impl Model {
             KeyCode::Char(' ') | KeyCode::Char('p') | KeyCode::Char('P') => {
                 Some((VideoCommand::TogglePause, "Toggled inline video playback."))
             }
+            KeyCode::Char('v') | KeyCode::Char('V') => Some((
+                VideoCommand::ToggleMute,
+                "Toggled inline video sound (videos start muted).",
+            )),
             KeyCode::Char('[') | KeyCode::Char('{') => Some((
                 VideoCommand::SeekRelative(-5.0),
                 "Rewound inline video 5 seconds.",
@@ -5374,19 +5527,84 @@ impl Model {
 
         self.numeric_jump = None;
 
+        let hovered = pane_at(&self.pane_areas, event.column, event.row);
         match event.kind {
+            // The wheel scrolls whatever is under the pointer. It never moves
+            // the focus or the selection.
             MouseEventKind::ScrollDown => {
-                self.navigate_in_focus(1)?;
-                self.mark_dirty();
+                self.scroll_pane(hovered.unwrap_or(self.focused_pane), true);
             }
             MouseEventKind::ScrollUp => {
-                self.navigate_in_focus(-1)?;
-                self.mark_dirty();
+                self.scroll_pane(hovered.unwrap_or(self.focused_pane), false);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(pane) = hovered {
+                    self.focus_pane(pane);
+                }
             }
             _ => {}
         }
 
         Ok(())
+    }
+
+    /// Focuses `pane` (mouse click), with the same side effects as h/l.
+    fn focus_pane(&mut self, pane: Pane) {
+        self.free_scroll = FreeScroll::default();
+        if pane == self.focused_pane {
+            self.mark_dirty();
+            return;
+        }
+        self.focused_pane = pane;
+        if pane == Pane::Navigation {
+            self.close_action_menu(None);
+        }
+        self.status_message = Self::focus_status_for(pane);
+        self.mark_dirty();
+    }
+
+    /// Scrolls `pane`'s viewport one wheel notch without touching focus or
+    /// selection. Lists scroll by one item, the content pane by a few lines.
+    fn scroll_pane(&mut self, pane: Pane, down: bool) {
+        let step_offset = |offset: usize, len: usize| -> usize {
+            let last = len.saturating_sub(1);
+            if down {
+                offset.saturating_add(1).min(last)
+            } else {
+                offset.saturating_sub(1).min(last)
+            }
+        };
+        match pane {
+            Pane::Navigation => {
+                let len = self.subreddits.len();
+                self.subreddit_offset
+                    .set(step_offset(self.subreddit_offset.get(), len));
+                self.free_scroll.navigation = true;
+            }
+            Pane::Posts => {
+                let len = self.posts.len();
+                self.post_offset
+                    .set(step_offset(self.post_offset.get(), len));
+                self.free_scroll.posts = true;
+            }
+            Pane::Comments => {
+                let len = self.visible_comment_indices.len();
+                self.comment_offset
+                    .set(step_offset(self.comment_offset.get(), len));
+                self.free_scroll.comments = true;
+            }
+            Pane::Content => {
+                self.content_scroll = if down {
+                    self.content_scroll.saturating_add(WHEEL_CONTENT_LINES)
+                } else {
+                    self.content_scroll.saturating_sub(WHEEL_CONTENT_LINES)
+                };
+                if self.selected_post_has_inline_media() {
+                    self.needs_kitty_flush = true;
+                }
+            }
+        }
+        self.mark_dirty();
     }
 
     fn handle_menu_key(&mut self, code: KeyCode) -> Result<bool> {
@@ -5869,6 +6087,13 @@ impl Model {
             }
         }
 
+        let goto_entry = ActionMenuEntry::new("Go to author or subreddit…", ActionMenuAction::GoTo);
+        entries.push(if self.goto_targets().is_empty() {
+            goto_entry.disabled()
+        } else {
+            goto_entry
+        });
+
         entries.push(ActionMenuEntry::new(
             "Search subreddits & users…",
             ActionMenuAction::OpenNavigation,
@@ -5926,9 +6151,70 @@ impl Model {
         }
     }
 
-    fn open_navigation_mode(&mut self, filter: String, editing: bool) {
+    /// Places the item in focus can lead to: its author's page and the
+    /// subreddit of the selected post.
+    fn goto_targets(&self) -> Vec<NavigationMatch> {
+        let mut targets = Vec::new();
+        if let Some(author) = self.author_in_focus() {
+            targets.push(
+                NavigationMatch::new(format!("u/{author}"), NavigationTarget::User(author))
+                    .with_description("author's page"),
+            );
+        }
+        if !self.banner_selected() {
+            let subreddit = self
+                .posts
+                .get(self.selected_post)
+                .map(|post| post.post.subreddit.trim())
+                .filter(|name| !name.is_empty());
+            if let Some(subreddit) = subreddit {
+                let name = normalize_subreddit_name(subreddit);
+                targets.push(
+                    NavigationMatch::new(name.clone(), NavigationTarget::Subreddit(name))
+                        .with_description("subreddit of this post"),
+                );
+            }
+        }
+        targets
+    }
+
+    /// Chooser between the author's page and the post's subreddit.
+    fn open_goto_menu(&mut self) {
+        let preset = self.goto_targets();
+        if preset.is_empty() {
+            self.status_message = "Nothing to go to from here.".to_string();
+            self.mark_dirty();
+            return;
+        }
         self.queue_active_kitty_delete();
-        let state = self.build_navigation_state(filter, editing);
+        let mut state = NavigationMenuState::new(String::new(), preset.clone(), false, false);
+        state.preset = preset;
+        self.action_menu_items.clear();
+        self.action_menu_selected = 0;
+        self.action_link_items.clear();
+        self.action_menu_mode = ActionMenuMode::Navigation(state);
+        self.action_menu_visible = true;
+        self.status_message =
+            "Go to: j/k choose · Enter/l open · Tab type another destination · h/Esc back"
+                .to_string();
+        self.mark_dirty();
+    }
+
+    /// Opens the palette as a search prompt (the `/` key).
+    fn open_search(&mut self) {
+        self.open_palette(String::new(), true, true);
+        self.status_message =
+            "Search: type a query · Enter searches Reddit · ↑/↓ other matches · Esc clear/close"
+                .to_string();
+    }
+
+    fn open_navigation_mode(&mut self, filter: String, editing: bool) {
+        self.open_palette(filter, editing, false);
+    }
+
+    fn open_palette(&mut self, filter: String, editing: bool, search_first: bool) {
+        self.queue_active_kitty_delete();
+        let state = self.build_navigation_state(filter, editing, search_first);
         self.action_menu_items.clear();
         self.action_menu_selected = 0;
         self.action_link_items.clear();
@@ -5940,12 +6226,17 @@ impl Model {
         self.mark_dirty();
     }
 
-    fn build_navigation_state(&self, filter: String, editing: bool) -> NavigationMenuState {
-        let matches = self.navigation_matches(&filter);
-        NavigationMenuState::new(filter, matches, editing)
+    fn build_navigation_state(
+        &self,
+        filter: String,
+        editing: bool,
+        search_first: bool,
+    ) -> NavigationMenuState {
+        let matches = self.navigation_matches(&filter, search_first);
+        NavigationMenuState::new(filter, matches, editing, search_first)
     }
 
-    fn navigation_matches(&self, filter: &str) -> Vec<NavigationMatch> {
+    fn navigation_matches(&self, filter: &str, search_first: bool) -> Vec<NavigationMatch> {
         let trimmed = filter.trim();
         let mut matches = Vec::new();
         let mut seen = HashSet::new();
@@ -5988,6 +6279,23 @@ impl Model {
 
         let trimmed_lower = trimmed.to_ascii_lowercase();
 
+        let search_entry = canonical_search_target(trimmed).map(|search_target| {
+            let term = search_target
+                .trim_start_matches("search:")
+                .trim()
+                .to_string();
+            NavigationMatch::new(
+                format!("Search Reddit for \"{}\"", term),
+                NavigationTarget::Search(term),
+            )
+            .with_description("search")
+        });
+        if search_first {
+            if let Some(entry) = search_entry.clone() {
+                push_navigation_entry(&mut matches, &mut seen, entry);
+            }
+        }
+
         let normalized = normalize_subreddit_name(trimmed);
         let direct = NavigationMatch::new(
             format!("Open {}", normalized),
@@ -6005,16 +6313,7 @@ impl Model {
             push_navigation_entry(&mut matches, &mut seen, entry);
         }
 
-        if let Some(search_target) = canonical_search_target(trimmed) {
-            let term = search_target
-                .trim_start_matches("search:")
-                .trim()
-                .to_string();
-            let entry = NavigationMatch::new(
-                format!("Search Reddit for \"{}\"", term),
-                NavigationTarget::Search(term.clone()),
-            )
-            .with_description("search");
+        if let Some(entry) = search_entry {
             push_navigation_entry(&mut matches, &mut seen, entry);
         }
 
@@ -6041,7 +6340,11 @@ impl Model {
         matches
     }
     fn refresh_navigation_matches(&self, state: &mut NavigationMenuState) {
-        state.matches = self.navigation_matches(&state.filter);
+        state.matches = if state.filter.trim().is_empty() && !state.preset.is_empty() {
+            state.preset.clone()
+        } else {
+            self.navigation_matches(&state.filter, state.search_first)
+        };
         state.ensure_selection();
     }
 
@@ -6426,6 +6729,10 @@ impl Model {
                                 self.open_navigation_mode(String::new(), true);
                                 return Ok(false);
                             }
+                            ActionMenuAction::GoTo => {
+                                self.open_goto_menu();
+                                return Ok(false);
+                            }
                         }
                     }
                     _ => {}
@@ -6505,8 +6812,11 @@ impl Model {
                                 if !self.action_menu_visible {
                                     return Ok(false);
                                 }
-                                state =
-                                    self.build_navigation_state(filter_snapshot, editing_snapshot);
+                                state = self.build_navigation_state(
+                                    filter_snapshot,
+                                    editing_snapshot,
+                                    state.search_first,
+                                );
                             }
                         } else {
                             self.status_message = "No results to open.".to_string();
@@ -6527,8 +6837,11 @@ impl Model {
                                     if !self.action_menu_visible {
                                         return Ok(false);
                                     }
-                                    state = self
-                                        .build_navigation_state(filter_snapshot, editing_snapshot);
+                                    state = self.build_navigation_state(
+                                        filter_snapshot,
+                                        editing_snapshot,
+                                        state.search_first,
+                                    );
                                 }
                             } else {
                                 self.status_message = "No results to open.".to_string();
@@ -7038,6 +7351,14 @@ impl Model {
                     ("Enter", "Activate whatever is highlighted"),
                     ("o", "Open the actions menu"),
                     ("g", "Open the navigation palette"),
+                    ("/", "Search Reddit from any pane"),
+                    ("a", "Open the page of the post or comment author"),
+                    ("Ctrl+V", "Open the post author's page (posts/content pane)"),
+                    (
+                        "Mouse",
+                        "Click a pane to focus it; the wheel scrolls without moving the selection",
+                    ),
+                    ("Ctrl+A", "Jump back to the home feed you start on"),
                     ("?", "Toggle this help overlay"),
                     ("m", "Open the guided setup menu"),
                     ("h / Esc", "Back out of menus"),
@@ -7076,6 +7397,7 @@ impl Model {
                         "Cycle between images in a Reddit gallery",
                     ),
                     ("space / p (video)", "Pause or resume inline playback"),
+                    ("v (video)", "Unmute or mute inline video (starts muted)"),
                     (
                         "[ / ] (video)",
                         "Seek inline video backward/forward 5 seconds",
@@ -7398,6 +7720,16 @@ impl Model {
 
     fn handle_async_response(&mut self, message: AsyncResponse) {
         match message {
+            AsyncResponse::UserProfile { name, result } => {
+                let key = name.to_ascii_lowercase();
+                self.pending_user_profiles.remove(&key);
+                // A failed lookup only costs the title summary; the user's
+                // posts load (and report errors) on their own.
+                if let Ok(profile) = result {
+                    self.user_profiles.insert(key, profile);
+                    self.mark_dirty();
+                }
+            }
             AsyncResponse::Posts {
                 request_id,
                 target,
@@ -9156,6 +9488,7 @@ impl Model {
             self.comment_sort_selected = false;
             let _ = self.stop_active_video(None, true);
             self.video_completed_post = None;
+            self.video_failed_post = None;
             self.sync_content_from_selection();
             if let Err(err) = self.load_comments_for_selection() {
                 self.comment_status = format!("Failed to load comments: {err}");
@@ -9573,6 +9906,89 @@ impl Model {
         total.saturating_sub(status_height)
     }
 
+    /// Returns to the feed Reddix opens on at startup (the home front page),
+    /// keeping the current sort.
+    fn go_home(&mut self) -> Result<()> {
+        self.activate_navigation_target(&NavigationTarget::Subreddit(HOME_FEED.to_string()))
+    }
+
+    /// Author of whatever is in focus: the highlighted comment in the comments
+    /// pane, otherwise the selected post. `None` for deleted authors.
+    fn author_in_focus(&self) -> Option<String> {
+        let comment_author = if self.focused_pane == Pane::Comments && !self.comment_sort_selected {
+            self.selected_comment_index()
+                .and_then(|idx| self.comments.get(idx))
+                .map(|entry| entry.author.as_str())
+                .filter(|author| is_real_author(author))
+        } else {
+            None
+        };
+        let post_author = || {
+            if self.banner_selected() {
+                return None;
+            }
+            self.posts
+                .get(self.selected_post)
+                .map(|post| post.post.author.as_str())
+                .filter(|author| is_real_author(author))
+        };
+        comment_author
+            .or_else(post_author)
+            .map(|author| author.trim().to_string())
+    }
+
+    /// Opens the user page (their submissions plus a profile summary in the
+    /// posts pane title) for the author in focus.
+    fn open_author_page(&mut self) -> Result<()> {
+        let Some(author) = self.author_in_focus() else {
+            self.status_message =
+                "No author to open here (deleted or nothing selected).".to_string();
+            return Ok(());
+        };
+        if self.feed_service.is_none() {
+            self.status_message = "Sign in to view user pages.".to_string();
+            return Ok(());
+        }
+        self.activate_navigation_target(&NavigationTarget::User(author))
+    }
+
+    /// Fetches the profile summary for `user` unless it is cached or in flight.
+    fn request_user_profile(&mut self, user: &str) {
+        let key = user.trim().to_ascii_lowercase();
+        if key.is_empty()
+            || self.user_profiles.contains_key(&key)
+            || self.pending_user_profiles.contains(&key)
+        {
+            return;
+        }
+        let Some(service) = self.feed_service.clone() else {
+            return;
+        };
+        self.pending_user_profiles.insert(key);
+        let tx = self.response_tx.clone();
+        let name = user.trim().to_string();
+        thread::spawn(move || {
+            let result = service.load_user_about(&name);
+            let _ = tx.send(AsyncResponse::UserProfile { name, result });
+        });
+    }
+
+    /// Title for the posts pane; on a user page it carries the profile summary.
+    fn posts_pane_title(&self) -> String {
+        let base = Pane::Posts.title();
+        let target = self.current_feed_target();
+        let FeedKind::User(user) = classify_feed_target(&target) else {
+            return base.to_string();
+        };
+        match self.user_profiles.get(&user.to_ascii_lowercase()) {
+            Some(profile) => {
+                let now = chrono::Utc::now().timestamp();
+                format!("{base} · {}", user_profile_summary(user, profile, now))
+            }
+            None => format!("{base} · u/{user}"),
+        }
+    }
+
     /// Moves the focused pane by a half or full viewport.
     fn page_in_focus(&mut self, span: PageSpan, forward: bool) -> Result<()> {
         let step = self.page_step(span, forward);
@@ -9810,6 +10226,13 @@ impl Model {
                         )
                         .trim()
                         .to_string();
+                        if matches!(classify_feed_target(target), FeedKind::User(_)) {
+                            // Without the `history` scope user pages come from
+                            // an author search, which misses hidden profiles.
+                            self.status_message.push_str(
+                                " — hidden profile, or reddit.scopes lacks \"history\" (add it and sign in again).",
+                            );
+                        }
                     }
                     self.queue_active_kitty_delete();
                     self.posts.clear();
@@ -10041,6 +10464,10 @@ impl Model {
 
     fn reload_posts(&mut self) -> Result<()> {
         self.ensure_cache_scope();
+        let profile_target = self.current_feed_target();
+        if let FeedKind::User(user) = classify_feed_target(&profile_target) {
+            self.request_user_profile(user);
+        }
         let Some(service) = &self.feed_service else {
             self.pending_posts = None;
             self.pending_comments = None;
@@ -10860,7 +11287,9 @@ impl Model {
             full,
         );
 
+        self.pane_areas.clear();
         if self.media_fullscreen {
+            self.pane_areas.push((Pane::Content, full));
             self.draw_content(frame, full);
             return;
         }
@@ -10910,6 +11339,7 @@ impl Model {
                 .split(layout[1]);
 
             for (pane, area) in window.iter().zip(main_chunks.iter()) {
+                self.pane_areas.push((*pane, *area));
                 match pane {
                     Pane::Navigation => self.draw_subreddits(frame, *area),
                     Pane::Posts => self.draw_posts(frame, *area),
@@ -11465,6 +11895,7 @@ impl Model {
         {
             self.active_video = None;
             self.pending_video_clear = Some((row, col, cols, rows));
+            let failed = !matches!(&result, Ok(status) if status.success());
             self.status_message = match result {
                 Ok(status) => {
                     if status.success() {
@@ -11474,13 +11905,20 @@ impl Model {
                             format!("Finished playing \"{}\".", label.trim())
                         }
                     } else if let Some(code) = status.code() {
-                        format!("Video playback ended with status {}.", code)
+                        format!(
+                            "Video playback ended with status {code}; not retrying. Set {VIDEO_DEBUG_HINT} to see mpv's error."
+                        )
                     } else {
                         "Video playback ended unexpectedly.".to_string()
                     }
                 }
                 Err(err) => format!("Video playback error: {}", err),
             };
+            if failed {
+                // Without this the next redraw would relaunch mpv, which
+                // fails the same way again, several times a second.
+                self.video_failed_post = Some(post_name.clone());
+            }
             self.needs_video_refresh = false;
             self.needs_kitty_flush = true;
             self.video_completed_post = Some(post_name);
@@ -11559,6 +11997,11 @@ impl Model {
             return Ok(());
         }
 
+        if self.video_failed_post.as_deref() == Some(post_name.as_str()) {
+            self.needs_video_refresh = false;
+            return Ok(());
+        }
+
         if !self.needs_video_refresh
             && self
                 .video_completed_post
@@ -11578,6 +12021,7 @@ impl Model {
     }
 
     fn restart_inline_video(&mut self) -> Result<()> {
+        self.video_failed_post = None;
         self.stop_active_video(None, true);
         self.needs_video_refresh = true;
         self.refresh_inline_video()
@@ -11598,9 +12042,11 @@ impl Model {
             Style::default().fg(self.theme.text_secondary)
         };
         let title_text = if pane == Pane::Content && self.media_fullscreen {
-            "Media Preview (fullscreen)"
+            "Media Preview (fullscreen)".to_string()
+        } else if pane == Pane::Posts {
+            self.posts_pane_title()
         } else {
-            pane.title()
+            pane.title().to_string()
         };
         Block::default()
             .title(Span::styled(title_text, title_style))
@@ -11798,7 +12244,9 @@ impl Model {
 
         self.subreddit_view_height.set(list_area.height);
         self.subreddit_view_width.set(list_area.width);
-        self.ensure_subreddit_visible();
+        if !self.free_scroll.navigation {
+            self.ensure_subreddit_visible();
+        }
 
         let width = list_area.width.max(1) as usize;
         let max_visible_height = list_area.height as usize;
@@ -11860,7 +12308,9 @@ impl Model {
         let width = inner.width.max(1) as usize;
         let pane_width = inner.width;
         self.post_view_height.set(inner.height);
-        self.ensure_post_visible();
+        if !self.free_scroll.posts {
+            self.ensure_post_visible();
+        }
         let offset = self.post_offset.get().min(self.posts.len());
 
         let mut score_width = 0usize;
@@ -11878,12 +12328,12 @@ impl Model {
             let installing = self.update_install_in_progress;
             let message = if installing {
                 format!(
-                    "Installing update: {} → {} (GitHub Releases)",
+                    "Installing update: {} → {} (local source)",
                     self.current_version, update.version
                 )
             } else {
                 format!(
-                    "Update available: {} → {} (GitHub Releases)",
+                    "Update available: {} → {} (local source)",
                     self.current_version, update.version
                 )
             };
@@ -12523,7 +12973,9 @@ impl Model {
         status_lines.push(Line::from(Span::styled(String::new(), status_style)));
         pad_lines_to_width(&mut status_lines, comment_area.width);
         self.comment_status_height.set(status_lines.len());
-        self.ensure_comment_visible();
+        if !self.free_scroll.comments {
+            self.ensure_comment_visible();
+        }
         let offset = self.comment_offset.get().min(total_visible);
         let available_height = self.available_comment_height();
         let mut used_height = 0usize;
@@ -12965,7 +13417,7 @@ impl Model {
             let hint_text = if self.update_install_in_progress {
                 "Installer running in background…"
             } else {
-                "Press Enter to download and run the official installer."
+                "Press Enter to rebuild from the local source checkout."
             };
             lines.push(Line::from(vec![Span::styled(
                 hint_text.to_string(),
@@ -13450,5 +13902,126 @@ mod tests {
         let heights = [2usize, 5, 1, 4, 3];
         assert_eq!(count_items_in_rows(8, 0, 5, true, |i| heights[i]), 3);
         assert_eq!(count_items_in_rows(8, 4, 5, false, |i| heights[i]), 2);
+    }
+
+    #[test]
+    fn compact_count_abbreviates() {
+        assert_eq!(compact_count(0), "0");
+        assert_eq!(compact_count(950), "950");
+        assert_eq!(compact_count(1_000), "1k");
+        assert_eq!(compact_count(3_182), "3.1k");
+        assert_eq!(compact_count(68_717), "68k");
+        assert_eq!(compact_count(756_624), "756k");
+        assert_eq!(compact_count(1_250_000), "1.2M");
+        assert_eq!(compact_count(-4_500), "-4.5k");
+    }
+
+    #[test]
+    fn compact_age_picks_largest_unit() {
+        let day = 86_400;
+        assert_eq!(compact_age(0, 12 * day), "12d");
+        assert_eq!(compact_age(0, 100 * day), "3mo");
+        assert_eq!(compact_age(0, 800 * day), "2y");
+        assert_eq!(compact_age(10 * day, 0), "0d");
+    }
+
+    #[test]
+    fn real_authors_exclude_deleted_placeholders() {
+        assert!(is_real_author("spez"));
+        assert!(!is_real_author("[deleted]"));
+        assert!(!is_real_author(" [removed] "));
+        assert!(!is_real_author("  "));
+    }
+
+    #[test]
+    fn user_profile_summary_is_compact() {
+        let profile = reddit::UserAbout {
+            name: "spez".into(),
+            link_karma: 184_793,
+            comment_karma: 756_624,
+            total_karma: 941_417,
+            created_utc: 1_118_030_400.0,
+            is_suspended: false,
+        };
+        let now = 1_118_030_400 + 21 * 365 * 86_400;
+        assert_eq!(
+            user_profile_summary("spez", &profile, now),
+            "u/spez · 184k/756k karma · 21y"
+        );
+        let suspended = reddit::UserAbout {
+            is_suspended: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            user_profile_summary("gone", &suspended, now),
+            "u/gone · suspended"
+        );
+    }
+
+    /// 2x2 palette-indexed PNG (color type 3), the shape Reddit serves for
+    /// PNG previews.
+    const INDEXED_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x03, 0x00, 0x00, 0x00, 0x45,
+        0x68, 0xfd, 0x16, 0x00, 0x00, 0x00, 0x09, 0x50, 0x4c, 0x54, 0x45, 0xff, 0x00, 0x00, 0x00,
+        0xff, 0x00, 0x00, 0x00, 0xff, 0x2d, 0x4a, 0xcd, 0x8a, 0x00, 0x00, 0x00, 0x0e, 0x49, 0x44,
+        0x41, 0x54, 0x78, 0x9c, 0x63, 0x60, 0x60, 0x64, 0x60, 0x62, 0x00, 0x00, 0x00, 0x0e, 0x00,
+        0x04, 0xc6, 0x88, 0x7c, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42,
+        0x60, 0x82,
+    ];
+
+    #[test]
+    fn kitty_png_is_normalized_from_indexed_color() {
+        let source = image::ImageReader::new(Cursor::new(INDEXED_PNG))
+            .with_guessed_format()
+            .unwrap();
+        assert_eq!(source.format(), Some(ImageFormat::Png));
+        // Byte 25 of a PNG is the IHDR color type: 3 = palette.
+        assert_eq!(INDEXED_PNG[25], 3);
+
+        let encoded = encode_png_for_kitty(INDEXED_PNG).unwrap();
+        assert_eq!(image::guess_format(&encoded).unwrap(), ImageFormat::Png);
+        // Bit depth 8, color type 2 = truecolor RGB.
+        assert_eq!(encoded[24], 8);
+        assert_eq!(encoded[25], 2);
+
+        let decoded = image::load_from_memory(&encoded).unwrap().to_rgb8();
+        assert_eq!(decoded.dimensions(), (2, 2));
+        assert_eq!(decoded.get_pixel(0, 0).0, [255, 0, 0]);
+        assert_eq!(decoded.get_pixel(1, 0).0, [0, 255, 0]);
+        assert_eq!(decoded.get_pixel(0, 1).0, [0, 0, 255]);
+        assert_eq!(decoded.get_pixel(1, 1).0, [255, 0, 0]);
+    }
+
+    #[test]
+    fn kitty_png_keeps_alpha_and_rejects_garbage() {
+        let mut rgba = image::RgbaImage::new(1, 1);
+        rgba.put_pixel(0, 0, image::Rgba([10, 20, 30, 40]));
+        let mut source = Vec::new();
+        image::DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut Cursor::new(&mut source), ImageFormat::Png)
+            .unwrap();
+        let encoded = encode_png_for_kitty(&source).unwrap();
+        // Color type 6 = truecolor with alpha.
+        assert_eq!(encoded[25], 6);
+
+        assert!(encode_png_for_kitty(b"").is_err());
+        assert!(encode_png_for_kitty(b"<html>blocked</html>").is_err());
+    }
+
+    #[test]
+    fn pane_at_hit_tests_drawn_areas() {
+        let areas = [
+            (Pane::Posts, Rect::new(0, 1, 40, 20)),
+            (Pane::Content, Rect::new(40, 1, 30, 20)),
+        ];
+        assert!(pane_at(&areas, 0, 1) == Some(Pane::Posts));
+        assert!(pane_at(&areas, 39, 20) == Some(Pane::Posts));
+        assert!(pane_at(&areas, 40, 1) == Some(Pane::Content));
+        assert!(pane_at(&areas, 69, 20) == Some(Pane::Content));
+        // Status line above, footer below, and past the right edge.
+        assert!(pane_at(&areas, 5, 0).is_none());
+        assert!(pane_at(&areas, 5, 21).is_none());
+        assert!(pane_at(&areas, 70, 5).is_none());
     }
 }
