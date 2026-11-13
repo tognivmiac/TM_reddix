@@ -4619,7 +4619,7 @@ impl Model {
         model.initialize_kitty_detection();
 
         if let Err(err) = model.reload_posts() {
-            model.status_message = format!("Failed to load posts: {err}");
+            model.status_message = format!("Failed to load posts: {err:#}");
             model.content = model.fallback_content.clone();
             model.content_source = model.fallback_source.clone();
         }
@@ -7386,7 +7386,7 @@ impl Model {
                         }
                     }
                     Err(err) => {
-                        self.status_message = format!("Failed to load posts: {err}");
+                        self.status_message = format!("Failed to load posts: {err:#}");
                     }
                 }
                 self.mark_dirty();
