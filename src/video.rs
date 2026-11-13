@@ -188,6 +188,73 @@ pub fn find_video_source(post: &reddit::Post) -> Option<VideoSource> {
                     .or_else(|| video_from_media(parent.media.as_ref(), &post.title))
             })
         })
+        .or_else(|| gif_source(post))
+}
+
+/// Animated GIF posts: Reddit's own mp4 rendition first, then the linked file.
+fn gif_source(post: &reddit::Post) -> Option<VideoSource> {
+    let label = || {
+        if post.title.trim().is_empty() {
+            "GIF".to_string()
+        } else {
+            post.title.trim().to_string()
+        }
+    };
+    let previews = std::iter::once(&post.preview).chain(
+        post.crosspost_parent_list
+            .iter()
+            .map(|parent| &parent.preview),
+    );
+
+    for preview in previews.clone() {
+        if let Some(video) = &preview.reddit_video_preview {
+            if let Some(mut source) = VideoSource::from_reddit_video(video, label().into()) {
+                source.is_gif = true;
+                return Some(source);
+            }
+        }
+    }
+    for preview in previews {
+        for image in &preview.images {
+            if let Some(variant) = image.variants.get("mp4") {
+                let url = sanitize_url(&variant.source.url);
+                if !url.is_empty() {
+                    return Some(VideoSource {
+                        playback_url: url,
+                        label: label(),
+                        is_gif: true,
+                        width: some_positive(variant.source.width),
+                        height: some_positive(variant.source.height),
+                    });
+                }
+            }
+        }
+    }
+
+    let url = direct_gif_url(&post.url)?;
+    Some(VideoSource {
+        playback_url: url,
+        label: label(),
+        is_gif: true,
+        width: None,
+        height: None,
+    })
+}
+
+/// Direct GIF links mpv can play. imgur's `.gifv` is an HTML page; its mp4
+/// sits at the same path.
+fn direct_gif_url(raw: &str) -> Option<String> {
+    let url = sanitize_url(raw);
+    let parsed = url::Url::parse(&url).ok()?;
+    let path = parsed.path().to_ascii_lowercase();
+    if path.ends_with(".gifv") {
+        let mut mp4 = parsed.clone();
+        let new_path = format!("{}mp4", &parsed.path()[..parsed.path().len() - 4]);
+        mp4.set_path(&new_path);
+        mp4.set_query(None);
+        return Some(mp4.to_string());
+    }
+    path.ends_with(".gif").then_some(url)
 }
 
 fn video_from_media(media: Option<&PostMedia>, title: &str) -> Option<VideoSource> {
@@ -621,6 +688,35 @@ fn command_payload(command: VideoCommand) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gif_links_become_video_sources() {
+        assert_eq!(
+            direct_gif_url("https://i.imgur.com/abc.gifv?x=1").as_deref(),
+            Some("https://i.imgur.com/abc.mp4")
+        );
+        assert_eq!(
+            direct_gif_url("https://i.redd.it/abc.GIF").as_deref(),
+            Some("https://i.redd.it/abc.GIF")
+        );
+        assert!(direct_gif_url("https://i.redd.it/abc.png").is_none());
+    }
+
+    #[test]
+    fn gif_prefers_reddit_mp4_variant() {
+        let post: reddit::Post = serde_json::from_value(serde_json::json!({
+            "id": "a", "name": "t3_a", "title": "t", "subreddit": "s", "author": "u", "permalink": "/p", "url": "https://i.redd.it/a.gif",
+            "preview": {"images": [{
+                "source": {"url": "https://preview.redd.it/a.jpg", "width": 1, "height": 1},
+                "variants": {"mp4": {"source": {"url": "https://preview.redd.it/a.mp4?a=1&amp;b=2", "width": 320, "height": 240}}}
+            }]}
+        }))
+        .unwrap();
+        let source = find_video_source(&post).unwrap();
+        assert!(source.is_gif);
+        assert_eq!(source.playback_url, "https://preview.redd.it/a.mp4?a=1&b=2");
+        assert_eq!(source.width, Some(320));
+    }
 
     #[test]
     fn prefers_fallback_url_when_available() {

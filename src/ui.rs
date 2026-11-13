@@ -70,6 +70,10 @@ const MIN_IMAGE_COLS: i32 = 12;
 const MIN_IMAGE_ROWS: i32 = 6;
 const TARGET_PREVIEW_WIDTH_PX: i64 = 480;
 const KITTY_CHUNK_SIZE: usize = 4096;
+const GIF_MAX_FRAMES: usize = 200;
+const GIF_MAX_ENCODED_BYTES: usize = 12 * 1024 * 1024;
+const GIF_MIN_DELAY_MS: u64 = 20;
+const GIF_MAX_WIDTH_PX: i64 = 640;
 const MEDIA_INDENT: u16 = 0;
 const KITTY_PROBE_TIMEOUT_MS: u64 = 150;
 const VIDEO_CACHE_TTL_SECS: u64 = 60 * 60 * 12;
@@ -516,6 +520,17 @@ struct KittyImage {
     transmit_chunks: Vec<String>,
     transmitted: bool,
     wrap_tmux: bool,
+    animation: Option<KittyAnimation>,
+}
+
+/// Client-driven animation: every frame is transmitted once under its own
+/// image id (`id + index`) and the placement is swapped on a timer, so it
+/// works in terminals that lack the kitty animation commands.
+#[derive(Clone)]
+struct KittyAnimation {
+    delays: Vec<Duration>,
+    current: usize,
+    next_at: Option<Instant>,
 }
 
 impl KittyImage {
@@ -531,11 +546,7 @@ impl KittyImage {
         Ok(())
     }
 
-    fn placement_sequence(&self) -> String {
-        let base = format!(
-            "\x1b_Ga=p,q=2,C=1,i={},c={},r={};\x1b\\",
-            self.id, self.cols, self.rows
-        );
+    fn wrap(&self, base: String) -> String {
         if self.wrap_tmux {
             format!("\x1bPtmux;\x1b{base}\x1b\\")
         } else {
@@ -543,8 +554,93 @@ impl KittyImage {
         }
     }
 
+    fn frame_id(&self) -> u32 {
+        match &self.animation {
+            Some(animation) => self.id.wrapping_add(animation.current as u32),
+            None => self.id,
+        }
+    }
+
+    fn frame_count(&self) -> u32 {
+        self.animation
+            .as_ref()
+            .map_or(1, |animation| animation.delays.len() as u32)
+    }
+
+    fn is_animated(&self) -> bool {
+        self.animation.is_some()
+    }
+
+    /// When the next frame is due, once the animation has been placed.
+    fn next_frame_at(&self) -> Option<Instant> {
+        self.animation
+            .as_ref()
+            .and_then(|animation| animation.next_at)
+    }
+
+    fn start_animation(&mut self, now: Instant) {
+        if let Some(animation) = &mut self.animation {
+            if animation.next_at.is_none() {
+                animation.next_at = Some(now + animation.delays[animation.current]);
+            }
+        }
+    }
+
+    /// Moves to the next frame when it is due and returns the id of the frame
+    /// that was showing.
+    fn advance(&mut self, now: Instant) -> Option<u32> {
+        let old = self.frame_id();
+        let animation = self.animation.as_mut()?;
+        if !self.transmitted || animation.next_at.is_none_or(|at| now < at) {
+            return None;
+        }
+        animation.current = (animation.current + 1) % animation.delays.len();
+        animation.next_at = Some(now + animation.delays[animation.current]);
+        Some(old)
+    }
+
+    fn placement_sequence(&self) -> String {
+        let placement_id = if self.is_animated() { ",p=1" } else { "" };
+        self.wrap(format!(
+            "\x1b_Ga=p,q=2,C=1,i={}{},c={},r={};\x1b\\",
+            self.frame_id(),
+            placement_id,
+            self.cols,
+            self.rows
+        ))
+    }
+
+    /// Removes one frame's placement but keeps its pixel data.
+    fn delete_placement_sequence(&self, frame_id: u32) -> String {
+        self.wrap(format!("\x1b_Ga=d,d=i,i={frame_id},p=1,q=2;\x1b\\"))
+    }
+
+    /// Removes the placement and, for animations, keeps the frames cached so
+    /// scrolling or closing a menu does not retransmit megabytes.
     fn delete_sequence(&self) -> String {
-        Self::delete_sequence_for(self.id, self.wrap_tmux)
+        if self.is_animated() {
+            self.delete_placement_sequence(self.frame_id())
+        } else {
+            Self::delete_sequence_for(self.id, self.wrap_tmux)
+        }
+    }
+
+    /// Frees every frame's data.
+    fn free_sequence(&self) -> String {
+        Self::free_frames_sequence(self.id, self.frame_count(), self.wrap_tmux)
+    }
+
+    fn free_frames_sequence(id: u32, frames: u32, wrap_tmux: bool) -> String {
+        let mut out = String::new();
+        for index in 0..frames {
+            let base = format!("\x1b_Ga=d,d=I,i={},q=2;\x1b\\", id.wrapping_add(index));
+            if wrap_tmux {
+                out.push_str(&format!("\x1bPtmux;\x1b{base}\x1b\\"));
+            } else {
+                out.push_str(&base);
+            }
+        }
+        out
     }
 
     fn delete_sequence_for(id: u32, wrap_tmux: bool) -> String {
@@ -668,6 +764,7 @@ fn kitty_delete_all_sequence() -> String {
 struct ActiveKitty {
     post_name: String,
     image_id: u32,
+    frames: u32,
     wrap_tmux: bool,
     row: u16,
     col: u16,
@@ -2137,6 +2234,27 @@ fn load_media_preview(
         max_rows.clamp(1, MAX_IMAGE_ROWS)
     };
 
+    if gallery.is_none() {
+        if let Some(source) = select_gif_source(post) {
+            match load_gif_preview(
+                theme,
+                post,
+                &source,
+                cancel_flag,
+                media_handle.clone(),
+                (capped_cols, capped_rows),
+                allow_upscale,
+                priority,
+            ) {
+                Ok(outcome) => return Ok(outcome),
+                // Not decodable (or single frame): fall back to mpv / still image.
+                Err(err) => {
+                    video::debug_log(format!("gif preview failed for {}: {err:#}", post.name))
+                }
+            }
+        }
+    }
+
     let video_source = if gallery.is_some() {
         None
     } else {
@@ -2313,6 +2431,64 @@ fn load_media_preview(
         limited_rows,
         video: video_preview,
         gallery: gallery_render,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_gif_preview(
+    theme: &crate::theme::Palette,
+    post: &reddit::Post,
+    source: &reddit::PreviewSource,
+    cancel_flag: &AtomicBool,
+    media_handle: Option<media::Handle>,
+    (max_cols, max_rows): (i32, i32),
+    allow_upscale: bool,
+    priority: media::Priority,
+) -> Result<MediaLoadOutcome> {
+    let url = &source.url;
+    let bytes = match media_handle {
+        Some(handle) => {
+            match fetch_cached_media_bytes(
+                handle,
+                url,
+                source.width,
+                source.height,
+                cancel_flag,
+                priority,
+            ) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => return Ok(MediaLoadOutcome::Deferred),
+                Err(_) => fetch_image_bytes(url)?,
+            }
+        }
+        None => fetch_image_bytes(url)?,
+    };
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Ok(MediaLoadOutcome::Deferred);
+    }
+
+    let frames = decode_gif_frames(&bytes)?;
+    let (cols, rows) = clamp_dimensions(
+        source.width,
+        source.height,
+        max_cols,
+        max_rows,
+        allow_upscale,
+    );
+    if cols < MIN_IMAGE_COLS || rows < MIN_IMAGE_ROWS {
+        bail!("viewport too small for gif");
+    }
+    let kitty = kitty_transmit_animation(&frames, cols, rows, kitty_image_id(&post.name, url))?;
+    let label = format!("{} (gif)", image_label(url));
+    Ok(MediaLoadOutcome::Ready(MediaPreview {
+        placeholder: kitty_placeholder_text(theme, cols, rows, MEDIA_INDENT, &label),
+        kitty: Some(kitty),
+        cols,
+        rows,
+        limited_cols: cols >= max_cols && (source.width as i32) > max_cols,
+        limited_rows: rows >= max_rows && (source.height as i32) > max_rows,
+        video: None,
+        gallery: None,
     }))
 }
 
@@ -2593,21 +2769,12 @@ fn tmux_passthrough_enabled() -> bool {
     env::var("TMUX").map(|v| !v.is_empty()).unwrap_or(false)
 }
 
-fn kitty_transmit_inline(bytes: &[u8], cols: i32, rows: i32, image_id: u32) -> Result<KittyImage> {
-    if bytes.is_empty() {
-        bail!("no image data provided");
-    }
-
-    let png_data = encode_png_for_kitty(bytes)?;
-
-    let cols = cols.max(1);
-    let rows = rows.max(1);
-    let encoded = general_purpose::STANDARD.encode(&png_data);
+fn kitty_png_chunks(png_data: &[u8], image_id: u32, wrap_tmux: bool) -> Result<Vec<String>> {
+    let encoded = general_purpose::STANDARD.encode(png_data);
     if encoded.is_empty() {
         bail!("failed to encode image preview");
     }
 
-    let wrap_tmux = tmux_passthrough_enabled();
     let prefix = if wrap_tmux { "\x1bPtmux;\x1b" } else { "" };
     let suffix = if wrap_tmux { "\x1b\\" } else { "" };
 
@@ -2617,9 +2784,7 @@ fn kitty_transmit_inline(bytes: &[u8], cols: i32, rows: i32, image_id: u32) -> R
         let end = usize::min(offset + KITTY_CHUNK_SIZE, encoded.len());
         let more = if end < encoded.len() { 1 } else { 0 };
         let mut out = String::new();
-        if wrap_tmux {
-            out.push_str(prefix);
-        }
+        out.push_str(prefix);
         if offset == 0 {
             out.push_str(&format!("\x1b_Ga=t,q=2,i={},f=100,m={more};", image_id));
         } else {
@@ -2627,20 +2792,167 @@ fn kitty_transmit_inline(bytes: &[u8], cols: i32, rows: i32, image_id: u32) -> R
         }
         out.push_str(&encoded[offset..end]);
         out.push_str("\x1b\\");
-        if wrap_tmux {
-            out.push_str(suffix);
-        }
+        out.push_str(suffix);
         chunks.push(out);
         offset = end;
     }
+    Ok(chunks)
+}
 
+fn kitty_transmit_inline(bytes: &[u8], cols: i32, rows: i32, image_id: u32) -> Result<KittyImage> {
+    if bytes.is_empty() {
+        bail!("no image data provided");
+    }
+
+    let png_data = encode_png_for_kitty(bytes)?;
+    let wrap_tmux = tmux_passthrough_enabled();
     Ok(KittyImage {
         id: image_id,
-        cols,
-        rows,
+        cols: cols.max(1),
+        rows: rows.max(1),
+        transmit_chunks: kitty_png_chunks(&png_data, image_id, wrap_tmux)?,
+        transmitted: false,
+        wrap_tmux,
+        animation: None,
+    })
+}
+
+struct GifFrame {
+    png: Vec<u8>,
+    delay: Duration,
+}
+
+/// Decodes an animated GIF into PNG frames, scaled to the preview width and
+/// capped in count and total size. Fails for single-frame images.
+fn decode_gif_frames(bytes: &[u8]) -> Result<Vec<GifFrame>> {
+    use image::AnimationDecoder;
+
+    let decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes)).context("read gif")?;
+    let mut frames = Vec::new();
+    let mut total = 0usize;
+    for frame in decoder.into_frames() {
+        let frame = frame.context("decode gif frame")?;
+        let (numer, denom) = frame.delay().numer_denom_ms();
+        let mut millis = u64::from(numer.checked_div(denom).unwrap_or(0));
+        if millis < GIF_MIN_DELAY_MS {
+            // Browsers treat sub-20ms delays as 100ms.
+            millis = 100;
+        }
+
+        let mut buffer = frame.into_buffer();
+        if i64::from(buffer.width()) > TARGET_PREVIEW_WIDTH_PX {
+            let width = TARGET_PREVIEW_WIDTH_PX as u32;
+            let height = ((u64::from(buffer.height()) * u64::from(width))
+                / u64::from(buffer.width()))
+            .max(1) as u32;
+            buffer = image::imageops::resize(
+                &buffer,
+                width,
+                height,
+                image::imageops::FilterType::Triangle,
+            );
+        }
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(buffer)
+            .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+            .context("encode gif frame")?;
+        total += png.len();
+        frames.push(GifFrame {
+            png,
+            delay: Duration::from_millis(millis),
+        });
+        if frames.len() >= GIF_MAX_FRAMES || total >= GIF_MAX_ENCODED_BYTES {
+            break;
+        }
+    }
+    if frames.len() < 2 {
+        bail!("gif has a single frame");
+    }
+    Ok(frames)
+}
+
+fn kitty_transmit_animation(
+    frames: &[GifFrame],
+    cols: i32,
+    rows: i32,
+    base_id: u32,
+) -> Result<KittyImage> {
+    let wrap_tmux = tmux_passthrough_enabled();
+    let mut chunks = Vec::new();
+    for (index, frame) in frames.iter().enumerate() {
+        chunks.extend(kitty_png_chunks(
+            &frame.png,
+            base_id.wrapping_add(index as u32),
+            wrap_tmux,
+        )?);
+    }
+    Ok(KittyImage {
+        id: base_id,
+        cols: cols.max(1),
+        rows: rows.max(1),
         transmit_chunks: chunks,
         transmitted: false,
         wrap_tmux,
+        animation: Some(KittyAnimation {
+            delays: frames.iter().map(|frame| frame.delay).collect(),
+            current: 0,
+            next_at: None,
+        }),
+    })
+}
+
+/// The GIF rendition to animate: Reddit's `gif` preview variant (largest size
+/// up to `GIF_MAX_WIDTH_PX`), or a directly linked `.gif`.
+fn select_gif_source(post: &reddit::Post) -> Option<reddit::PreviewSource> {
+    let previews = std::iter::once(&post.preview).chain(
+        post.crosspost_parent_list
+            .iter()
+            .map(|parent| &parent.preview),
+    );
+    for preview in previews {
+        for image in &preview.images {
+            let Some(variant) = image.variants.get("gif") else {
+                continue;
+            };
+            let candidates: Vec<reddit::PreviewSource> = variant
+                .resolutions
+                .iter()
+                .chain(std::iter::once(&variant.source))
+                .filter(|candidate| !candidate.url.trim().is_empty())
+                .map(|candidate| reddit::PreviewSource {
+                    url: sanitize_preview_url(&candidate.url),
+                    ..candidate.clone()
+                })
+                .collect();
+            let best = candidates
+                .iter()
+                .filter(|candidate| candidate.width <= GIF_MAX_WIDTH_PX)
+                .max_by_key(|candidate| candidate.width)
+                .or_else(|| candidates.iter().min_by_key(|candidate| candidate.width));
+            if let Some(best) = best {
+                return Some(best.clone());
+            }
+        }
+    }
+
+    let direct = sanitize_preview_url(post.url.trim());
+    let is_gif_link = Url::parse(&direct)
+        .map(|url| url.path().to_ascii_lowercase().ends_with(".gif"))
+        .unwrap_or(false);
+    if !is_gif_link {
+        return None;
+    }
+    let (width, height) = post
+        .preview
+        .images
+        .first()
+        .map(|image| (image.source.width, image.source.height))
+        .filter(|(width, height)| *width > 0 && *height > 0)
+        .unwrap_or((TARGET_PREVIEW_WIDTH_PX, TARGET_PREVIEW_WIDTH_PX * 9 / 16));
+    Some(reddit::PreviewSource {
+        url: direct,
+        width,
+        height,
     })
 }
 
@@ -4528,11 +4840,20 @@ impl Model {
             .is_some_and(|active| active.post_name == post_name)
     }
 
-    fn prepare_active_kitty_delete(&mut self) -> Option<String> {
+    /// `free` also drops the pixel data of animated images (used when leaving
+    /// the post); otherwise their frames stay cached for the next placement.
+    fn prepare_active_kitty_delete(&mut self, free: bool) -> Option<String> {
         let active = self.active_kitty.take()?;
         if let Some(preview) = self.media_previews.get_mut(&active.post_name) {
             if let Some(kitty) = preview.kitty_mut() {
                 if kitty.id == active.image_id {
+                    if kitty.is_animated() {
+                        if free {
+                            kitty.transmitted = false;
+                            return Some(kitty.free_sequence());
+                        }
+                        return Some(kitty.delete_sequence());
+                    }
                     if !kitty.transmitted {
                         return None;
                     }
@@ -4541,6 +4862,13 @@ impl Model {
                 }
             }
         }
+        if active.frames > 1 {
+            return Some(KittyImage::free_frames_sequence(
+                active.image_id,
+                active.frames,
+                active.wrap_tmux,
+            ));
+        }
         Some(KittyImage::delete_sequence_for(
             active.image_id,
             active.wrap_tmux,
@@ -4548,8 +4876,18 @@ impl Model {
     }
 
     fn queue_active_kitty_delete(&mut self) {
+        self.queue_kitty_delete(false);
+    }
+
+    /// Like `queue_active_kitty_delete`, but also drops an animated image's
+    /// cached frames; used when the selection leaves that post.
+    fn queue_active_kitty_free(&mut self) {
+        self.queue_kitty_delete(true);
+    }
+
+    fn queue_kitty_delete(&mut self, free: bool) {
         self.stop_active_video(None, true);
-        if let Some(sequence) = self.prepare_active_kitty_delete() {
+        if let Some(sequence) = self.prepare_active_kitty_delete(free) {
             self.pending_kitty_deletes.push(sequence);
             self.needs_kitty_flush = true;
             self.needs_redraw = true;
@@ -4560,7 +4898,15 @@ impl Model {
         &mut self,
         backend: &mut CrosstermBackend<Stdout>,
     ) -> io::Result<()> {
-        if let Some(sequence) = self.prepare_active_kitty_delete() {
+        self.emit_kitty_delete(backend, false)
+    }
+
+    fn emit_kitty_delete(
+        &mut self,
+        backend: &mut CrosstermBackend<Stdout>,
+        free: bool,
+    ) -> io::Result<()> {
+        if let Some(sequence) = self.prepare_active_kitty_delete(free) {
             crossterm::queue!(backend, Print(sequence))?;
             backend.flush()?;
         }
@@ -4890,9 +5236,14 @@ impl Model {
                 self.mark_dirty();
             }
 
-            let timeout = tick_rate
+            self.flush_animation_frame(terminal.backend_mut())?;
+
+            let mut timeout = tick_rate
                 .checked_sub(last_tick.elapsed())
                 .unwrap_or_else(|| Duration::from_millis(16));
+            if let Some(due) = self.animation_deadline() {
+                timeout = timeout.min(due.saturating_duration_since(Instant::now()));
+            }
 
             if event::poll(timeout)? {
                 match event::read()? {
@@ -5053,6 +5404,17 @@ impl Model {
                 // Post author's page, from the panes that show the post.
                 if matches!(self.focused_pane, Pane::Posts | Pane::Content) {
                     self.open_author_page()?;
+                    self.mark_dirty();
+                }
+                return Ok(false);
+            }
+            if matches!(code, KeyCode::Char('r') | KeyCode::Char('R')) {
+                // The selected post's subreddit, from any pane that shows a post.
+                if matches!(
+                    self.focused_pane,
+                    Pane::Posts | Pane::Content | Pane::Comments
+                ) {
+                    self.open_post_subreddit()?;
                     self.mark_dirty();
                 }
                 return Ok(false);
@@ -7354,6 +7716,7 @@ impl Model {
                     ("/", "Search Reddit from any pane"),
                     ("a", "Open the page of the post or comment author"),
                     ("Ctrl+V", "Open the post author's page (posts/content pane)"),
+                    ("Ctrl+R", "Open the selected post's subreddit"),
                     (
                         "Mouse",
                         "Click a pane to focus it; the wheel scrolls without moving the selection",
@@ -9482,7 +9845,7 @@ impl Model {
         self.selected_post = clamped;
         if changed {
             self.dismiss_release_note();
-            self.queue_active_kitty_delete();
+            self.queue_active_kitty_free();
             self.comment_offset.set(0);
             self.close_action_menu(None);
             self.comment_sort_selected = false;
@@ -9952,6 +10315,27 @@ impl Model {
         self.activate_navigation_target(&NavigationTarget::User(author))
     }
 
+    fn open_post_subreddit(&mut self) -> Result<()> {
+        let subreddit = if self.banner_selected() {
+            None
+        } else {
+            self.posts
+                .get(self.selected_post)
+                .map(|post| post.post.subreddit.trim().to_string())
+                .filter(|name| !name.is_empty())
+        };
+        let Some(subreddit) = subreddit else {
+            self.status_message = "No post selected.".to_string();
+            return Ok(());
+        };
+        if self.feed_service.is_none() {
+            self.status_message = "Sign in to browse subreddits.".to_string();
+            return Ok(());
+        }
+        let name = normalize_subreddit_name(&subreddit);
+        self.activate_navigation_target(&NavigationTarget::Subreddit(name))
+    }
+
     /// Fetches the profile summary for `user` unless it is cached or in flight.
     fn request_user_profile(&mut self, user: &str) {
         let key = user.trim().to_ascii_lowercase();
@@ -10234,7 +10618,7 @@ impl Model {
                             );
                         }
                     }
-                    self.queue_active_kitty_delete();
+                    self.queue_active_kitty_free();
                     self.posts.clear();
                     self.feed_after = batch.after.take();
                     self.post_offset.set(0);
@@ -10287,7 +10671,7 @@ impl Model {
                         if filtered_nsfw == 1 { "" } else { "s" }
                     ));
                 }
-                self.queue_active_kitty_delete();
+                self.queue_active_kitty_free();
                 self.posts = batch.posts;
                 self.feed_after = batch.after;
                 self.gallery_states = self
@@ -10471,7 +10855,7 @@ impl Model {
         let Some(service) = &self.feed_service else {
             self.pending_posts = None;
             self.pending_comments = None;
-            self.queue_active_kitty_delete();
+            self.queue_active_kitty_free();
             self.posts.clear();
             self.feed_after = None;
             self.post_offset.set(0);
@@ -11403,6 +11787,38 @@ impl Model {
         })
     }
 
+    fn active_animation(&mut self) -> Option<&mut KittyImage> {
+        let active = self.active_kitty.as_ref()?;
+        let kitty = self
+            .media_previews
+            .get_mut(&active.post_name)?
+            .kitty_mut()?;
+        (kitty.id == active.image_id && kitty.is_animated()).then_some(kitty)
+    }
+
+    fn animation_deadline(&mut self) -> Option<Instant> {
+        self.active_animation()?.next_frame_at()
+    }
+
+    /// Shows the next frame of the placed GIF when it is due, without a full redraw.
+    fn flush_animation_frame(&mut self, backend: &mut CrosstermBackend<Stdout>) -> Result<()> {
+        let Some(active) = self.active_kitty.as_ref() else {
+            return Ok(());
+        };
+        let (row, col) = (active.row, active.col);
+        let Some(kitty) = self.active_animation() else {
+            return Ok(());
+        };
+        let Some(old_id) = kitty.advance(Instant::now()) else {
+            return Ok(());
+        };
+        let place = kitty.placement_sequence();
+        let remove_old = kitty.delete_placement_sequence(old_id);
+        crossterm::queue!(backend, MoveTo(col, row), Print(place), Print(remove_old))?;
+        backend.flush()?;
+        Ok(())
+    }
+
     fn flush_inline_clears(&mut self, backend: &mut CrosstermBackend<Stdout>) -> Result<()> {
         self.flush_pending_kitty_deletes(backend)?;
 
@@ -11458,7 +11874,7 @@ impl Model {
             .as_ref()
             .is_some_and(|active| active.post_name != post_name)
         {
-            self.emit_active_kitty_delete(backend)?;
+            self.emit_kitty_delete(backend, true)?;
         }
         if !self.media_previews.contains_key(&post_name) {
             if self.active_kitty_matches(&post_name) {
@@ -11548,6 +11964,7 @@ impl Model {
 
         let was_transmitted = kitty.transmitted;
         kitty.ensure_transmitted(backend)?;
+        kitty.start_animation(Instant::now());
         let sequence = kitty.placement_sequence();
         crossterm::queue!(backend, MoveTo(col, row), Print(sequence))?;
         backend.flush()?;
@@ -11559,6 +11976,7 @@ impl Model {
         self.active_kitty = Some(ActiveKitty {
             post_name,
             image_id: kitty.id,
+            frames: kitty.frame_count(),
             wrap_tmux: kitty.wrap_tmux,
             row,
             col,
@@ -13786,6 +14204,79 @@ fn pane_constraints(panes: &[Pane; 3]) -> [Constraint; 3] {
 
 #[cfg(test)]
 mod tests {
+    fn sample_gif(frames: u8) -> Vec<u8> {
+        use image::codecs::gif::GifEncoder;
+        use image::{Delay, Frame, Rgba, RgbaImage};
+        let mut out = Vec::new();
+        {
+            let mut encoder = GifEncoder::new(&mut out);
+            for n in 0..frames {
+                let img = RgbaImage::from_pixel(8, 6, Rgba([n * 40, 0, 0, 255]));
+                let frame = Frame::from_parts(img, 0, 0, Delay::from_numer_denom_ms(50, 1));
+                encoder.encode_frame(frame).unwrap();
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn gif_frames_are_decoded_with_delays() {
+        let frames = decode_gif_frames(&sample_gif(3)).unwrap();
+        assert_eq!(frames.len(), 3);
+        assert!(frames.iter().all(|f| f.delay == Duration::from_millis(50)));
+        assert!(decode_gif_frames(&sample_gif(1)).is_err());
+    }
+
+    #[test]
+    fn gif_animation_cycles_frames_and_ids() {
+        let frames = decode_gif_frames(&sample_gif(3)).unwrap();
+        let mut kitty = kitty_transmit_animation(&frames, 10, 5, 100).unwrap();
+        assert_eq!(kitty.frame_count(), 3);
+        let t0 = Instant::now();
+        // Not transmitted / not started yet: no advance.
+        assert!(kitty.advance(t0).is_none());
+        kitty.transmitted = true;
+        kitty.start_animation(t0);
+        assert!(kitty.advance(t0).is_none());
+        let t1 = t0 + Duration::from_millis(60);
+        assert_eq!(kitty.advance(t1), Some(100));
+        assert_eq!(kitty.frame_id(), 101);
+        assert!(kitty.placement_sequence().contains("i=101,p=1"));
+        let t2 = t1 + Duration::from_millis(60);
+        assert_eq!(kitty.advance(t2), Some(101));
+        let t3 = t2 + Duration::from_millis(60);
+        assert_eq!(kitty.advance(t3), Some(102));
+        assert_eq!(kitty.frame_id(), 100, "wraps back to the first frame");
+        // Every frame is transmitted under its own id.
+        let all = kitty.transmit_chunks.concat();
+        for id in [100, 101, 102] {
+            assert!(all.contains(&format!("i={id},f=100")));
+        }
+        assert!(kitty.free_sequence().matches("d=I").count() == 3);
+    }
+
+    #[test]
+    fn gif_source_prefers_reddit_gif_variant_under_width_cap() {
+        let post: reddit::Post = serde_json::from_value(serde_json::json!({
+            "id": "a", "name": "t3_a", "title": "t", "subreddit": "s", "author": "u",
+            "permalink": "/p", "url": "https://i.redd.it/a.gif",
+            "preview": {"images": [{
+                "source": {"url": "https://preview.redd.it/a.jpg", "width": 1, "height": 1},
+                "variants": {"gif": {
+                    "source": {"url": "https://preview.redd.it/a.gif?x=1&amp;y=2", "width": 1200, "height": 800},
+                    "resolutions": [
+                        {"url": "https://preview.redd.it/s.gif", "width": 320, "height": 213},
+                        {"url": "https://preview.redd.it/m.gif", "width": 640, "height": 426},
+                        {"url": "https://preview.redd.it/l.gif", "width": 960, "height": 640}
+                    ]
+                }}
+            }]}
+        }))
+        .unwrap();
+        let source = select_gif_source(&post).unwrap();
+        assert_eq!(source.url, "https://preview.redd.it/m.gif");
+    }
+
     use super::*;
     use std::sync::{Mutex, OnceLock};
 

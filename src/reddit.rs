@@ -546,6 +546,9 @@ impl Post {
 pub struct Preview {
     #[serde(default)]
     pub images: Vec<PreviewImage>,
+    /// Muted mp4 rendition Reddit generates for animated GIF posts.
+    #[serde(default, rename = "reddit_video_preview")]
+    pub reddit_video_preview: Option<RedditVideo>,
     #[serde(default)]
     pub enabled: bool,
 }

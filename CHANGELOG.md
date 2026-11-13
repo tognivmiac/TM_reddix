@@ -10,9 +10,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [0.2.9+tm.20261113] - 2026-11-13
 Personal fork build on top of upstream 0.2.9. Fork builds keep the upstream base version and append `+tm.<YYYYMMDD>`, the build date in UTC.
 ### Added
+- Animated GIF posts play inline without mpv: the GIF is decoded in-process and its frames are shown through the kitty graphics protocol (up to 200 frames / ~12 MB, scaled to 480 px wide, looping). If a GIF cannot be decoded, Reddix falls back to Reddit's mp4 rendition via mpv, and `.gifv` links map to their `.mp4`.
 - User pages: press `a` (or use the actions menu) to open the page of the selected post's or comment's author. The actions menu entry "Go to author or subreddit…" lets you pick between the author's page and the post's subreddit. The posts pane title shows their post/comment karma and account age.
 - `/` opens a search prompt from any pane; Enter searches Reddit for what you typed.
 - `Ctrl+V` opens the post author's page from the posts or content pane.
+- `Ctrl+R` opens the selected post's subreddit (`r/…`). It used to fall through to the plain `r` reload.
 - Mouse: clicking a pane focuses it, and the wheel scrolls the pane under the pointer.
 - Inline video starts muted; press `v` while it plays to toggle sound.
 - `Ctrl+A` jumps back to the home feed Reddix starts on (`r/frontpage`).
