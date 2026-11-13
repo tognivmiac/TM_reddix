@@ -5,7 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
-- Nothing yet.
+### Added
+- Vim-style paging: `Ctrl+D`/`Ctrl+U` move half a page and `Ctrl+F`/`Ctrl+B` a full page in every pane.
+### Changed
+- `PageUp`/`PageDown`/`Space` now move by what actually fits in the focused pane instead of a fixed step.
+### Fixed
+- Feed, subreddit, and subscription requests no longer fail with `403 Forbidden`; the HTTP client now negotiates HTTP/2.
 
 ## [0.2.9] - 2025-11-05
 ### Added

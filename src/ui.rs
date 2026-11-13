@@ -1496,6 +1496,57 @@ enum AsyncResponse {
     },
 }
 
+/// How far a paging key (Ctrl+D/U, Ctrl+F/B, PageUp/PageDown) moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageSpan {
+    Half,
+    Full,
+}
+
+impl PageSpan {
+    /// Rows covered by this span in a viewport of `viewport` rows.
+    fn rows(self, viewport: usize) -> usize {
+        match self {
+            PageSpan::Half => viewport / 2,
+            PageSpan::Full => viewport,
+        }
+    }
+}
+
+/// Counts how many list items, walking from `current` in the given direction,
+/// fit inside `rows` terminal rows. Always at least 1 so paging never stalls
+/// on an item taller than the span.
+fn count_items_in_rows(
+    rows: usize,
+    current: usize,
+    len: usize,
+    forward: bool,
+    height_of: impl Fn(usize) -> usize,
+) -> i32 {
+    let mut used = 0usize;
+    let mut count = 0i32;
+    let mut fits = |idx: usize| {
+        used = used.saturating_add(height_of(idx).max(1));
+        used <= rows
+    };
+    if forward {
+        for idx in current..len {
+            if !fits(idx) {
+                break;
+            }
+            count += 1;
+        }
+    } else {
+        for idx in (0..current.min(len)).rev() {
+            if !fits(idx) {
+                break;
+            }
+            count += 1;
+        }
+    }
+    count.max(1)
+}
+
 fn comment_lines(
     comment: &CommentEntry,
     width: usize,
@@ -4852,6 +4903,21 @@ impl Model {
             self.numeric_jump = None;
         }
 
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            let paging = match code {
+                KeyCode::Char('d') | KeyCode::Char('D') => Some((PageSpan::Half, true)),
+                KeyCode::Char('u') | KeyCode::Char('U') => Some((PageSpan::Half, false)),
+                KeyCode::Char('f') | KeyCode::Char('F') => Some((PageSpan::Full, true)),
+                KeyCode::Char('b') | KeyCode::Char('B') => Some((PageSpan::Full, false)),
+                _ => None,
+            };
+            if let Some((span, forward)) = paging {
+                self.page_in_focus(span, forward)?;
+                self.mark_dirty();
+                return Ok(false);
+            }
+        }
+
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
             KeyCode::Char('m') | KeyCode::Char('M') => {
@@ -4904,9 +4970,7 @@ impl Model {
                 dirty = true;
             }
             KeyCode::Char('f') | KeyCode::Char('F') => {
-                if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                    self.toggle_media_fullscreen()?;
-                }
+                self.toggle_media_fullscreen()?;
             }
             KeyCode::Char('u') => {
                 if self.banner_selected() {
@@ -5062,26 +5126,12 @@ impl Model {
                 dirty = true;
             }
             KeyCode::PageDown | KeyCode::Char(' ') => {
-                let step = if self.focused_pane == Pane::Posts {
-                    self.posts_page_step()
-                } else {
-                    5
-                };
-                if step != 0 {
-                    self.navigate_in_focus(step)?;
-                    dirty = true;
-                }
+                self.page_in_focus(PageSpan::Full, true)?;
+                dirty = true;
             }
             KeyCode::PageUp => {
-                let step = if self.focused_pane == Pane::Posts {
-                    self.posts_page_step()
-                } else {
-                    5
-                };
-                if step != 0 {
-                    self.navigate_in_focus(-step)?;
-                    dirty = true;
-                }
+                self.page_in_focus(PageSpan::Full, false)?;
+                dirty = true;
             }
             KeyCode::Home => {
                 if self.focused_pane == Pane::Posts {
@@ -5106,56 +5156,54 @@ impl Model {
                     }
                 }
             }
-            KeyCode::Char(ch) if ch.is_ascii_digit() => {
-                if self.focused_pane == Pane::Posts {
-                    let now = Instant::now();
-                    let digit = ch.to_digit(10).unwrap() as usize;
-                    let timeout = Duration::from_millis(800);
-                    let (base, continuing) = match &self.numeric_jump {
-                        Some(jump) if now.duration_since(jump.last_input) <= timeout => {
-                            (jump.value, true)
-                        }
-                        _ => (0, false),
-                    };
-                    let new_value = if continuing {
-                        base.saturating_mul(10).saturating_add(digit)
-                    } else if digit == 0 {
-                        10
-                    } else {
-                        digit
-                    };
-                    self.numeric_jump = Some(NumericJump {
-                        value: new_value,
-                        last_input: now,
-                    });
-
-                    if self.posts.is_empty() {
-                        self.status_message = "No posts available to select.".to_string();
-                    } else {
-                        let max_index = self.posts.len() - 1;
-                        let target = new_value.saturating_sub(1);
-                        if target > max_index {
-                            self.status_message = format!(
-                                "Only {} post{} loaded right now.",
-                                self.posts.len(),
-                                if self.posts.len() == 1 {
-                                    " is"
-                                } else {
-                                    "s are"
-                                }
-                            );
-                        } else {
-                            let previous = self.selected_post;
-                            self.select_post_at(target);
-                            self.status_message = if self.selected_post != previous {
-                                format!("Selected post #{}.", self.selected_post + 1)
-                            } else {
-                                format!("Already on post #{}.", self.selected_post + 1)
-                            };
-                        }
+            KeyCode::Char(ch) if ch.is_ascii_digit() && self.focused_pane == Pane::Posts => {
+                let now = Instant::now();
+                let digit = ch.to_digit(10).unwrap() as usize;
+                let timeout = Duration::from_millis(800);
+                let (base, continuing) = match &self.numeric_jump {
+                    Some(jump) if now.duration_since(jump.last_input) <= timeout => {
+                        (jump.value, true)
                     }
-                    dirty = true;
+                    _ => (0, false),
+                };
+                let new_value = if continuing {
+                    base.saturating_mul(10).saturating_add(digit)
+                } else if digit == 0 {
+                    10
+                } else {
+                    digit
+                };
+                self.numeric_jump = Some(NumericJump {
+                    value: new_value,
+                    last_input: now,
+                });
+
+                if self.posts.is_empty() {
+                    self.status_message = "No posts available to select.".to_string();
+                } else {
+                    let max_index = self.posts.len() - 1;
+                    let target = new_value.saturating_sub(1);
+                    if target > max_index {
+                        self.status_message = format!(
+                            "Only {} post{} loaded right now.",
+                            self.posts.len(),
+                            if self.posts.len() == 1 {
+                                " is"
+                            } else {
+                                "s are"
+                            }
+                        );
+                    } else {
+                        let previous = self.selected_post;
+                        self.select_post_at(target);
+                        self.status_message = if self.selected_post != previous {
+                            format!("Selected post #{}.", self.selected_post + 1)
+                        } else {
+                            format!("Already on post #{}.", self.selected_post + 1)
+                        };
+                    }
                 }
+                dirty = true;
             }
             _ => {}
         }
@@ -5265,11 +5313,7 @@ impl Model {
             return Ok(false);
         };
 
-        if self.cycle_gallery(delta as isize) {
-            return Ok(true);
-        }
-
-        Ok(false)
+        Ok(self.cycle_gallery(delta as isize))
     }
 
     fn cycle_gallery(&mut self, delta: isize) -> bool {
@@ -5983,7 +6027,7 @@ impl Model {
             }
         }
 
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|entry| std::cmp::Reverse(entry.0));
 
         for (_, idx) in scored {
             let (label, target, description) = &stored[idx];
@@ -6983,7 +7027,9 @@ impl Model {
                     ("j / k", "Step through lists and menus"),
                     ("Ctrl+H/J/K/L", "Steer overlays even when typing"),
                     ("↑ / ↓", "Scroll within long views"),
-                    ("Page↑ / Page↓ / Space", "Jump by a larger chunk"),
+                    ("Page↑ / Page↓ / Space", "Move a full page"),
+                    ("Ctrl+D / Ctrl+U", "Move half a page down or up"),
+                    ("Ctrl+F / Ctrl+B", "Move a full page down or up"),
                 ],
             ),
             HelpSection::new(
@@ -9527,11 +9573,77 @@ impl Model {
         total.saturating_sub(status_height)
     }
 
-    fn posts_page_step(&self) -> i32 {
-        let visible = self.post_view_height.get();
-        let visible = if visible == 0 { 1 } else { visible as usize };
-        let step = visible.saturating_sub(1).max(1);
-        step as i32
+    /// Moves the focused pane by a half or full viewport.
+    fn page_in_focus(&mut self, span: PageSpan, forward: bool) -> Result<()> {
+        let step = self.page_step(span, forward);
+        if step == 0 {
+            return Ok(());
+        }
+        self.navigate_in_focus(if forward { step } else { -step })
+    }
+
+    /// Size of a paging move for the focused pane, in the unit
+    /// `navigate_in_focus` expects: lines for the content pane, items for the
+    /// list panes (as many as fit in the rows being paged over). Zero means
+    /// there is nothing left to page through.
+    fn page_step(&self, span: PageSpan, forward: bool) -> i32 {
+        match self.focused_pane {
+            Pane::Navigation => {
+                if !matches!(self.nav_mode, NavMode::Subreddits) {
+                    return 1;
+                }
+                let rows = span.rows(self.subreddit_view_height.get() as usize);
+                let width = self.subreddit_view_width.get().max(1) as usize;
+                count_items_in_rows(
+                    rows,
+                    self.nav_index,
+                    self.subreddits.len(),
+                    forward,
+                    |idx| self.subreddit_item_height(idx, width),
+                )
+            }
+            Pane::Posts => {
+                let rows = span.rows(self.available_post_height(self.post_offset.get()));
+                count_items_in_rows(rows, self.selected_post, self.posts.len(), forward, |idx| {
+                    self.post_item_height(idx)
+                })
+            }
+            Pane::Content => {
+                let area = self.content_area.unwrap_or_default();
+                let height = area.height as usize;
+                let rows = match span {
+                    PageSpan::Half => height / 2,
+                    // Keep a couple of lines of context, like a pager.
+                    PageSpan::Full => height.saturating_sub(2),
+                }
+                .max(1);
+                let rows = if forward {
+                    // Stop near the end instead of paging into empty space.
+                    // The wrapped height is an estimate (word wrapping can
+                    // add rows), so leave half a pane of slack; j/k still
+                    // scroll line by line past this point.
+                    let total = visual_height(&self.content.lines, area.width);
+                    let last_top = total.saturating_sub(height / 2);
+                    rows.min(last_top.saturating_sub(self.content_scroll as usize))
+                } else {
+                    rows
+                };
+                rows.min(i32::MAX as usize) as i32
+            }
+            Pane::Comments => {
+                if self.comment_sort_selected {
+                    return 1;
+                }
+                let rows = span.rows(self.available_comment_height());
+                count_items_in_rows(
+                    rows,
+                    self.selected_comment,
+                    self.visible_comment_indices.len(),
+                    forward,
+                    |idx| self.comment_item_height(idx),
+                )
+            }
+        }
     }
 
     fn set_sort_by_index(&mut self, index: usize) -> Result<()> {
@@ -13301,5 +13413,42 @@ mod tests {
             placeholder.lines[2].spans[0].content.as_ref(),
             "[image: example]"
         );
+    }
+
+    #[test]
+    fn page_span_rows() {
+        assert_eq!(PageSpan::Full.rows(21), 21);
+        assert_eq!(PageSpan::Half.rows(21), 10);
+        assert_eq!(PageSpan::Half.rows(0), 0);
+    }
+
+    #[test]
+    fn count_items_in_rows_walks_forward_and_backward() {
+        // Ten items, each 3 rows tall.
+        let height = |_: usize| 3;
+        assert_eq!(count_items_in_rows(12, 0, 10, true, height), 4);
+        assert_eq!(count_items_in_rows(12, 9, 10, false, height), 4);
+        // Partial items do not count.
+        assert_eq!(count_items_in_rows(11, 0, 10, true, height), 3);
+        // Running out of items caps the count.
+        assert_eq!(count_items_in_rows(30, 8, 10, true, height), 2);
+        assert_eq!(count_items_in_rows(30, 2, 10, false, height), 2);
+    }
+
+    #[test]
+    fn count_items_in_rows_never_stalls() {
+        // An item taller than the span, an empty viewport, or the list edge
+        // still yields a step of one.
+        assert_eq!(count_items_in_rows(4, 0, 10, true, |_| 9), 1);
+        assert_eq!(count_items_in_rows(0, 3, 10, true, |_| 3), 1);
+        assert_eq!(count_items_in_rows(12, 0, 10, false, |_| 3), 1);
+        assert_eq!(count_items_in_rows(12, 0, 0, true, |_| 3), 1);
+    }
+
+    #[test]
+    fn count_items_in_rows_uses_per_item_heights() {
+        let heights = [2usize, 5, 1, 4, 3];
+        assert_eq!(count_items_in_rows(8, 0, 5, true, |i| heights[i]), 3);
+        assert_eq!(count_items_in_rows(8, 4, 5, false, |i| heights[i]), 2);
     }
 }

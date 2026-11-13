@@ -385,10 +385,19 @@ pub fn save_reddit_credentials(
 mod tests {
     use super::*;
     use std::env;
+    use std::sync::{Mutex, MutexGuard};
     use tempfile::tempdir;
+
+    /// `load` reads process-wide env vars, so tests that touch or depend on
+    /// them must not run concurrently.
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn load_defaults_without_files() {
+        let _env = env_lock();
         let cfg = load(LoadOptions::default()).unwrap();
         assert_eq!(cfg.ui.theme, "default");
         assert!(cfg.ui.cell_width.is_none());
@@ -407,6 +416,7 @@ mod tests {
 
     #[test]
     fn env_overrides() {
+        let _env = env_lock();
         env::set_var("REDDIX_UI__THEME", "dracula");
         env::set_var("REDDIX_UI__CELL_WIDTH", "8.5");
         env::set_var("REDDIX_UI__CELL_HEIGHT", "16.25");

@@ -53,7 +53,7 @@ yay -S reddix-bin
 
 Note: As of Nov 2025, Reddit blocked the old `reddit.com/prefs/apps` flow. Apply via the [Reddit support form](https://support.reddithelp.com/hc/en-us/requests/new?ticket_form_id=14868593862164&tf_14867328473236=api_request_type_enterprise) (context: https://www.reddit.com/r/redditdev/comments/1oug31u/introducing_the_responsible_builder_policy_new/).
 
-Core shortcuts: `j/k` move, `h/l` change panes, `m` guided menu, `o` action menu, `r` refresh, `s` sync subs, `u/d` vote, `q` quit.
+Core shortcuts: `j/k` move, `Ctrl+d`/`Ctrl+u` half page, `Ctrl+f`/`Ctrl+b` (or `PgDn`/`PgUp`) full page, `h/l` change panes, `m` guided menu, `o` action menu, `r` refresh, `s` sync subs, `u/d` vote, `q` quit.
 
 ## Support
 
