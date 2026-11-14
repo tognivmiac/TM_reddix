@@ -547,11 +547,7 @@ impl KittyImage {
     }
 
     fn wrap(&self, base: String) -> String {
-        if self.wrap_tmux {
-            format!("\x1bPtmux;\x1b{base}\x1b\\")
-        } else {
-            base
-        }
+        tmux_wrap(base, self.wrap_tmux)
     }
 
     fn frame_id(&self) -> u32 {
@@ -631,25 +627,16 @@ impl KittyImage {
     }
 
     fn free_frames_sequence(id: u32, frames: u32, wrap_tmux: bool) -> String {
-        let mut out = String::new();
-        for index in 0..frames {
-            let base = format!("\x1b_Ga=d,d=I,i={},q=2;\x1b\\", id.wrapping_add(index));
-            if wrap_tmux {
-                out.push_str(&format!("\x1bPtmux;\x1b{base}\x1b\\"));
-            } else {
-                out.push_str(&base);
-            }
-        }
-        out
+        (0..frames)
+            .map(|index| {
+                let frame_id = id.wrapping_add(index);
+                tmux_wrap(format!("\x1b_Ga=d,d=I,i={frame_id},q=2;\x1b\\"), wrap_tmux)
+            })
+            .collect()
     }
 
     fn delete_sequence_for(id: u32, wrap_tmux: bool) -> String {
-        let base = format!("\x1b_Ga=d,q=2,i={id};\x1b\\");
-        if wrap_tmux {
-            format!("\x1bPtmux;\x1b{}\x1b\\", base)
-        } else {
-            base
-        }
+        tmux_wrap(format!("\x1b_Ga=d,q=2,i={id};\x1b\\"), wrap_tmux)
     }
 }
 
@@ -752,13 +739,20 @@ fn kitty_debug_enabled() -> bool {
     *FLAG.get_or_init(|| env_truthy("REDDIX_DEBUG_KITTY"))
 }
 
-fn kitty_delete_all_sequence() -> String {
-    let base = "\x1b_Ga=d,q=0;\x1b\\";
-    if tmux_passthrough_enabled() {
-        format!("\x1bPtmux;\x1b{}\x1b\\", base)
+/// Wraps a kitty graphics escape for tmux passthrough when `wrap_tmux` is set.
+fn tmux_wrap(sequence: String, wrap_tmux: bool) -> String {
+    if wrap_tmux {
+        format!("\x1bPtmux;\x1b{sequence}\x1b\\")
     } else {
-        base.to_string()
+        sequence
     }
+}
+
+fn kitty_delete_all_sequence() -> String {
+    tmux_wrap(
+        "\x1b_Ga=d,q=0;\x1b\\".to_string(),
+        tmux_passthrough_enabled(),
+    )
 }
 
 struct ActiveKitty {
@@ -2366,22 +2360,10 @@ fn load_media_preview(
         return Ok(MediaLoadOutcome::Deferred);
     }
 
-    let bytes = if let Some(handle) = media_handle {
-        match fetch_cached_media_bytes(
-            handle,
-            &url,
-            source.width,
-            source.height,
-            cancel_flag,
-            priority,
-        ) {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => return Ok(MediaLoadOutcome::Deferred),
-            Err(_) => fetch_image_bytes(&url)
-                .with_context(|| format!("download preview image {}", url))?,
-        }
-    } else {
-        fetch_image_bytes(&url).with_context(|| format!("download preview image {}", url))?
+    let Some(bytes) = fetch_preview_bytes(media_handle, &source, cancel_flag, priority)
+        .with_context(|| format!("download preview image {}", url))?
+    else {
+        return Ok(MediaLoadOutcome::Deferred);
     };
     if cancel_flag.load(Ordering::SeqCst) {
         return Ok(MediaLoadOutcome::Deferred);
@@ -2446,22 +2428,8 @@ fn load_gif_preview(
     priority: media::Priority,
 ) -> Result<MediaLoadOutcome> {
     let url = &source.url;
-    let bytes = match media_handle {
-        Some(handle) => {
-            match fetch_cached_media_bytes(
-                handle,
-                url,
-                source.width,
-                source.height,
-                cancel_flag,
-                priority,
-            ) {
-                Ok(Some(bytes)) => bytes,
-                Ok(None) => return Ok(MediaLoadOutcome::Deferred),
-                Err(_) => fetch_image_bytes(url)?,
-            }
-        }
-        None => fetch_image_bytes(url)?,
+    let Some(bytes) = fetch_preview_bytes(media_handle, source, cancel_flag, priority)? else {
+        return Ok(MediaLoadOutcome::Deferred);
     };
     if cancel_flag.load(Ordering::SeqCst) {
         return Ok(MediaLoadOutcome::Deferred);
@@ -2490,6 +2458,31 @@ fn load_gif_preview(
         video: None,
         gallery: None,
     }))
+}
+
+/// Downloads a preview through the media cache, falling back to a direct
+/// request when the cache fails. `None` means the request was cancelled.
+fn fetch_preview_bytes(
+    media_handle: Option<media::Handle>,
+    source: &reddit::PreviewSource,
+    cancel_flag: &AtomicBool,
+    priority: media::Priority,
+) -> Result<Option<Vec<u8>>> {
+    let url = &source.url;
+    let Some(handle) = media_handle else {
+        return fetch_image_bytes(url).map(Some);
+    };
+    match fetch_cached_media_bytes(
+        handle,
+        url,
+        source.width,
+        source.height,
+        cancel_flag,
+        priority,
+    ) {
+        Ok(bytes) => Ok(bytes),
+        Err(_) => fetch_image_bytes(url).map(Some),
+    }
 }
 
 fn fetch_cached_media_bytes(
@@ -2775,27 +2768,22 @@ fn kitty_png_chunks(png_data: &[u8], image_id: u32, wrap_tmux: bool) -> Result<V
         bail!("failed to encode image preview");
     }
 
-    let prefix = if wrap_tmux { "\x1bPtmux;\x1b" } else { "" };
-    let suffix = if wrap_tmux { "\x1b\\" } else { "" };
-
-    let mut chunks: Vec<String> = Vec::new();
-    let mut offset = 0;
-    while offset < encoded.len() {
-        let end = usize::min(offset + KITTY_CHUNK_SIZE, encoded.len());
-        let more = if end < encoded.len() { 1 } else { 0 };
-        let mut out = String::new();
-        out.push_str(prefix);
-        if offset == 0 {
-            out.push_str(&format!("\x1b_Ga=t,q=2,i={},f=100,m={more};", image_id));
-        } else {
-            out.push_str(&format!("\x1b_Ga=t,q=2,i={},m={more};", image_id));
-        }
-        out.push_str(&encoded[offset..end]);
-        out.push_str("\x1b\\");
-        out.push_str(suffix);
-        chunks.push(out);
-        offset = end;
-    }
+    let last = encoded.len().div_ceil(KITTY_CHUNK_SIZE) - 1;
+    let chunks = encoded
+        .as_bytes()
+        .chunks(KITTY_CHUNK_SIZE)
+        .enumerate()
+        .map(|(index, chunk)| {
+            // Base64 is ASCII, so any byte split is a valid str.
+            let payload = std::str::from_utf8(chunk).unwrap_or_default();
+            let more = u8::from(index < last);
+            let format = if index == 0 { ",f=100" } else { "" };
+            tmux_wrap(
+                format!("\x1b_Ga=t,q=2,i={image_id}{format},m={more};{payload}\x1b\\"),
+                wrap_tmux,
+            )
+        })
+        .collect();
     Ok(chunks)
 }
 
@@ -2904,12 +2892,7 @@ fn kitty_transmit_animation(
 /// The GIF rendition to animate: Reddit's `gif` preview variant (largest size
 /// up to `GIF_MAX_WIDTH_PX`), or a directly linked `.gif`.
 fn select_gif_source(post: &reddit::Post) -> Option<reddit::PreviewSource> {
-    let previews = std::iter::once(&post.preview).chain(
-        post.crosspost_parent_list
-            .iter()
-            .map(|parent| &parent.preview),
-    );
-    for preview in previews {
+    for preview in post.previews() {
         for image in &preview.images {
             let Some(variant) = image.variants.get("gif") else {
                 continue;
@@ -3100,28 +3083,50 @@ fn line_is_blank(line: &Line<'_>) -> bool {
             .all(|span| span.content.as_ref().trim().is_empty())
 }
 
-fn line_visual_height(line: &Line<'_>, width: u16) -> usize {
-    if width == 0 {
-        return 0;
-    }
-    let width = width as usize;
-    let content_width: usize = line
-        .spans
-        .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-        .sum();
-    if content_width == 0 {
-        1
-    } else {
-        content_width.div_ceil(width)
+/// Gallery image (0-based) a digit key selects: 1-9 pick that image; 0 goes
+/// to the tenth and, pressed again, on through the rest, wrapping back to the
+/// tenth after the last. `None` when the gallery has no such image.
+fn gallery_digit_target(digit: usize, current: usize, len: usize) -> Option<usize> {
+    match digit {
+        1..=9 => (digit <= len).then_some(digit - 1),
+        0 if len >= 10 => Some(if (9..len - 1).contains(&current) {
+            current + 1
+        } else {
+            9
+        }),
+        _ => None,
     }
 }
 
-fn visual_height(lines: &[Line<'_>], width: u16) -> usize {
-    lines
-        .iter()
-        .map(|line| line_visual_height(line, width))
-        .sum()
+/// Rows `lines` occupy once the content pane has word-wrapped them to
+/// `width`. Asks ratatui itself, so it matches what gets drawn.
+fn wrapped_height(lines: &[Line<'_>], width: u16) -> usize {
+    if lines.is_empty() || width == 0 {
+        return 0;
+    }
+    Paragraph::new(Text::from(lines.to_vec()))
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+}
+
+/// Where the media placeholder starting at logical line `line_offset` lands in
+/// a pane of `width` x `height` scrolled by `scroll` rows. Returns the wrapped
+/// row of the placeholder and its row inside the pane, or `None` when its top
+/// is outside the pane.
+///
+/// `scroll` is in wrapped rows, the unit `Paragraph::scroll` uses. Treating it
+/// as a count of logical lines made the image drift up into the text above it
+/// whenever lines before it wrapped.
+fn media_row(
+    lines: &[Line<'_>],
+    line_offset: usize,
+    scroll: usize,
+    width: u16,
+    height: u16,
+) -> Option<(usize, u16)> {
+    let visual_offset = wrapped_height(&lines[..line_offset.min(lines.len())], width);
+    let relative_row = visual_offset.checked_sub(scroll)?;
+    (relative_row < height as usize).then_some((visual_offset, relative_row as u16))
 }
 
 fn wrap_with_prefix(text: &str, width: usize, prefix: &str, style: Style) -> Vec<Line<'static>> {
@@ -5383,41 +5388,11 @@ impl Model {
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
-            let paging = match code {
-                KeyCode::Char('d') | KeyCode::Char('D') => Some((PageSpan::Half, true)),
-                KeyCode::Char('u') | KeyCode::Char('U') => Some((PageSpan::Half, false)),
-                KeyCode::Char('f') | KeyCode::Char('F') => Some((PageSpan::Full, true)),
-                KeyCode::Char('b') | KeyCode::Char('B') => Some((PageSpan::Full, false)),
-                _ => None,
-            };
-            if let Some((span, forward)) = paging {
-                self.page_in_focus(span, forward)?;
-                self.mark_dirty();
-                return Ok(false);
-            }
-            if matches!(code, KeyCode::Char('a') | KeyCode::Char('A')) {
-                self.go_home()?;
-                self.mark_dirty();
-                return Ok(false);
-            }
-            if matches!(code, KeyCode::Char('v') | KeyCode::Char('V')) {
-                // Post author's page, from the panes that show the post.
-                if matches!(self.focused_pane, Pane::Posts | Pane::Content) {
-                    self.open_author_page()?;
+            if let KeyCode::Char(ch) = code {
+                if self.handle_ctrl_shortcut(ch.to_ascii_lowercase())? {
                     self.mark_dirty();
+                    return Ok(false);
                 }
-                return Ok(false);
-            }
-            if matches!(code, KeyCode::Char('r') | KeyCode::Char('R')) {
-                // The selected post's subreddit, from any pane that shows a post.
-                if matches!(
-                    self.focused_pane,
-                    Pane::Posts | Pane::Content | Pane::Comments
-                ) {
-                    self.open_post_subreddit()?;
-                    self.mark_dirty();
-                }
-                return Ok(false);
             }
         }
 
@@ -5817,44 +5792,62 @@ impl Model {
         }
 
         let delta = match key.code {
-            KeyCode::Char('[') | KeyCode::Char('{') => Some(-1),
-            KeyCode::Char(']') | KeyCode::Char('}') => Some(1),
-            KeyCode::Char(',') | KeyCode::Char('<') => Some(-1),
-            KeyCode::Char('.') | KeyCode::Char('>') => Some(1),
-            _ => None,
+            KeyCode::Char('[') | KeyCode::Char('{') => -1,
+            KeyCode::Char(']') | KeyCode::Char('}') => 1,
+            KeyCode::Char(',') | KeyCode::Char('<') => -1,
+            KeyCode::Char('.') | KeyCode::Char('>') => 1,
+            // Digits pick an image directly while the content pane has focus
+            // (in the posts pane they jump to a post).
+            KeyCode::Char(ch) if ch.is_ascii_digit() && self.focused_pane == Pane::Content => {
+                let digit = ch.to_digit(10).unwrap_or(0) as usize;
+                return Ok(self.jump_gallery(digit));
+            }
+            _ => return Ok(false),
         };
 
-        let Some(delta) = delta else {
-            return Ok(false);
-        };
-
-        Ok(self.cycle_gallery(delta as isize))
+        Ok(self.cycle_gallery(delta))
     }
 
     fn cycle_gallery(&mut self, delta: isize) -> bool {
-        if self.banner_selected() {
-            return false;
-        }
+        self.select_gallery_image(|current, len| {
+            Some((current as isize + delta).rem_euclid(len as isize) as usize)
+        })
+    }
 
-        let post = match self.posts.get(self.selected_post).cloned() {
-            Some(post) => post,
-            None => return false,
+    /// Digit keys: 1-9 show that image, 0 steps through the tenth and later.
+    /// Returns whether the key was used (the post has a gallery).
+    fn jump_gallery(&mut self, digit: usize) -> bool {
+        let mut total = 0;
+        let changed = self.select_gallery_image(|current, len| {
+            total = len;
+            gallery_digit_target(digit, current, len)
+        });
+        if !changed && total >= 2 && gallery_digit_target(digit, usize::MAX, total).is_none() {
+            self.status_message = format!("This gallery has {total} images.");
+            self.mark_dirty();
+        }
+        total >= 2
+    }
+
+    /// Shows the gallery image `pick(current, len)` chooses for the selected
+    /// post. Returns whether the image changed.
+    fn select_gallery_image(&mut self, pick: impl FnOnce(usize, usize) -> Option<usize>) -> bool {
+        let Some(post) = self.selected_reddit_post().cloned() else {
+            return false;
         };
 
         let (len, new_index, label) = {
-            let state = match self.gallery_state_for_post(&post.post) {
-                Some(state) => state,
-                None => return false,
+            let Some(state) = self.gallery_state_for_post(&post) else {
+                return false;
             };
             let len = state.len();
             if len < 2 {
                 return false;
             }
             let current = state.index;
-            let new_index = ((current as isize + delta).rem_euclid(len as isize)) as usize;
-            if new_index == current {
+            let Some(new_index) = pick(current, len).filter(|index| *index != current) else {
                 return false;
-            }
+            };
             state.index = new_index;
             let label = state
                 .current()
@@ -5863,7 +5856,7 @@ impl Model {
             (len, new_index, label)
         };
 
-        let key = post.post.name.clone();
+        let key = post.name.clone();
         if let Some(flag) = self.pending_media.remove(&key) {
             flag.store(true, Ordering::SeqCst);
         }
@@ -5871,8 +5864,9 @@ impl Model {
         self.media_previews.remove(&key);
         self.media_failures.remove(&key);
         self.queue_active_kitty_delete();
-        self.request_media_preview(&post.post);
-        self.sync_content_from_selection();
+        self.request_media_preview(&post);
+        // Same post, different image: keep the reader's place.
+        self.resync_content_keeping_scroll(false);
         self.status_message = format!("Gallery image {}/{} — {}", new_index + 1, len, label);
         self.mark_dirty();
         true
@@ -5893,11 +5887,9 @@ impl Model {
         match event.kind {
             // The wheel scrolls whatever is under the pointer. It never moves
             // the focus or the selection.
-            MouseEventKind::ScrollDown => {
-                self.scroll_pane(hovered.unwrap_or(self.focused_pane), true);
-            }
-            MouseEventKind::ScrollUp => {
-                self.scroll_pane(hovered.unwrap_or(self.focused_pane), false);
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let down = event.kind == MouseEventKind::ScrollDown;
+                self.scroll_pane(hovered.unwrap_or(self.focused_pane), down);
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(pane) = hovered {
@@ -6523,19 +6515,11 @@ impl Model {
                     .with_description("author's page"),
             );
         }
-        if !self.banner_selected() {
-            let subreddit = self
-                .posts
-                .get(self.selected_post)
-                .map(|post| post.post.subreddit.trim())
-                .filter(|name| !name.is_empty());
-            if let Some(subreddit) = subreddit {
-                let name = normalize_subreddit_name(subreddit);
-                targets.push(
-                    NavigationMatch::new(name.clone(), NavigationTarget::Subreddit(name))
-                        .with_description("subreddit of this post"),
-                );
-            }
+        if let Some(name) = self.selected_post_subreddit() {
+            targets.push(
+                NavigationMatch::new(name.clone(), NavigationTarget::Subreddit(name))
+                    .with_description("subreddit of this post"),
+            );
         }
         targets
     }
@@ -6548,18 +6532,12 @@ impl Model {
             self.mark_dirty();
             return;
         }
-        self.queue_active_kitty_delete();
         let mut state = NavigationMenuState::new(String::new(), preset.clone(), false, false);
         state.preset = preset;
-        self.action_menu_items.clear();
-        self.action_menu_selected = 0;
-        self.action_link_items.clear();
-        self.action_menu_mode = ActionMenuMode::Navigation(state);
-        self.action_menu_visible = true;
-        self.status_message =
-            "Go to: j/k choose · Enter/l open · Tab type another destination · h/Esc back"
-                .to_string();
-        self.mark_dirty();
+        self.show_navigation_palette(
+            state,
+            "Go to: j/k choose · Enter/l open · Tab type another destination · h/Esc back",
+        );
     }
 
     /// Opens the palette as a search prompt (the `/` key).
@@ -6575,16 +6553,22 @@ impl Model {
     }
 
     fn open_palette(&mut self, filter: String, editing: bool, search_first: bool) {
-        self.queue_active_kitty_delete();
         let state = self.build_navigation_state(filter, editing, search_first);
+        self.show_navigation_palette(
+            state,
+            "Navigation: type to search · ↑/↓ choose · Enter/l open · Tab toggle typing · Esc clear/close · n toggle NSFW · h back · Ctrl+H/J/K/L navigate (even when typing)",
+        );
+    }
+
+    /// Shows the navigation palette overlay in `state`.
+    fn show_navigation_palette(&mut self, state: NavigationMenuState, status: &str) {
+        self.queue_active_kitty_delete();
         self.action_menu_items.clear();
         self.action_menu_selected = 0;
         self.action_link_items.clear();
         self.action_menu_mode = ActionMenuMode::Navigation(state);
         self.action_menu_visible = true;
-        self.status_message =
-            "Navigation: type to search · ↑/↓ choose · Enter/l open · Tab toggle typing · Esc clear/close · n toggle NSFW · h back · Ctrl+H/J/K/L navigate (even when typing)"
-                .to_string();
+        self.status_message = status.to_string();
         self.mark_dirty();
     }
 
@@ -7759,6 +7743,10 @@ impl Model {
                         ", / . (gallery)",
                         "Cycle between images in a Reddit gallery",
                     ),
+                    (
+                        "1-9 / 0 (gallery)",
+                        "In the content pane: show that image; 0 steps through the 10th and later",
+                    ),
                     ("space / p (video)", "Pause or resume inline playback"),
                     ("v (video)", "Unmute or mute inline video (starts muted)"),
                     (
@@ -8350,7 +8338,9 @@ impl Model {
                     .get(self.selected_post)
                     .map(|post| post.post.name.as_str());
                 if current == Some(post_name.as_str()) {
-                    self.sync_content_from_selection();
+                    // The post did not change, only its media: keep the
+                    // reader's scroll position.
+                    self.resync_content_keeping_scroll(true);
                     if let Some(preview) = self.media_previews.get(&post_name) {
                         if let Some(gallery) = preview.gallery() {
                             self.status_message = format!(
@@ -10287,12 +10277,8 @@ impl Model {
             None
         };
         let post_author = || {
-            if self.banner_selected() {
-                return None;
-            }
-            self.posts
-                .get(self.selected_post)
-                .map(|post| post.post.author.as_str())
+            self.selected_reddit_post()
+                .map(|post| post.author.as_str())
                 .filter(|author| is_real_author(author))
         };
         comment_author
@@ -10315,16 +10301,22 @@ impl Model {
         self.activate_navigation_target(&NavigationTarget::User(author))
     }
 
+    /// The selected post, unless the update banner holds the selection.
+    fn selected_reddit_post(&self) -> Option<&reddit::Post> {
+        if self.banner_selected() {
+            return None;
+        }
+        self.posts.get(self.selected_post).map(|post| &post.post)
+    }
+
+    /// Normalized `r/name` of the selected post's subreddit.
+    fn selected_post_subreddit(&self) -> Option<String> {
+        let subreddit = self.selected_reddit_post()?.subreddit.trim();
+        (!subreddit.is_empty()).then(|| normalize_subreddit_name(subreddit))
+    }
+
     fn open_post_subreddit(&mut self) -> Result<()> {
-        let subreddit = if self.banner_selected() {
-            None
-        } else {
-            self.posts
-                .get(self.selected_post)
-                .map(|post| post.post.subreddit.trim().to_string())
-                .filter(|name| !name.is_empty())
-        };
-        let Some(subreddit) = subreddit else {
+        let Some(name) = self.selected_post_subreddit() else {
             self.status_message = "No post selected.".to_string();
             return Ok(());
         };
@@ -10332,7 +10324,6 @@ impl Model {
             self.status_message = "Sign in to browse subreddits.".to_string();
             return Ok(());
         }
-        let name = normalize_subreddit_name(&subreddit);
         self.activate_navigation_target(&NavigationTarget::Subreddit(name))
     }
 
@@ -10371,6 +10362,32 @@ impl Model {
             }
             None => format!("{base} · u/{user}"),
         }
+    }
+
+    /// Ctrl+<key> shortcuts of the main view. Returns whether `ch` was one;
+    /// other keys fall through to the unmodified bindings.
+    fn handle_ctrl_shortcut(&mut self, ch: char) -> Result<bool> {
+        match ch {
+            'd' => self.page_in_focus(PageSpan::Half, true)?,
+            'u' => self.page_in_focus(PageSpan::Half, false)?,
+            'f' => self.page_in_focus(PageSpan::Full, true)?,
+            'b' => self.page_in_focus(PageSpan::Full, false)?,
+            'a' => self.go_home()?,
+            // Post author's page, from the panes that show the post.
+            'v' => {
+                if matches!(self.focused_pane, Pane::Posts | Pane::Content) {
+                    self.open_author_page()?;
+                }
+            }
+            // The selected post's subreddit, from any pane that shows a post.
+            'r' => {
+                if self.focused_pane != Pane::Navigation {
+                    self.open_post_subreddit()?;
+                }
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
     }
 
     /// Moves the focused pane by a half or full viewport.
@@ -10418,11 +10435,10 @@ impl Model {
                 }
                 .max(1);
                 let rows = if forward {
-                    // Stop near the end instead of paging into empty space.
-                    // The wrapped height is an estimate (word wrapping can
-                    // add rows), so leave half a pane of slack; j/k still
+                    // Stop near the end instead of paging into empty space,
+                    // keeping the last half pane of text in view; j/k still
                     // scroll line by line past this point.
-                    let total = visual_height(&self.content.lines, area.width);
+                    let total = wrapped_height(&self.content.lines, area.width);
                     let last_top = total.saturating_sub(height / 2);
                     rows.min(last_top.saturating_sub(self.content_scroll as usize))
                 } else {
@@ -11162,6 +11178,20 @@ impl Model {
         Ok(())
     }
 
+    /// Rebuilds the content pane for the same post without jumping back to
+    /// the top. `clamp` limits the offset to the rebuilt content; skip it
+    /// while media is still loading and the content is temporarily shorter.
+    fn resync_content_keeping_scroll(&mut self, clamp: bool) {
+        let scroll = self.content_scroll;
+        self.sync_content_from_selection();
+        self.content_scroll = if clamp {
+            let max_scroll = self.content.lines.len().saturating_sub(1);
+            scroll.min(max_scroll.min(u16::MAX as usize) as u16)
+        } else {
+            scroll
+        };
+    }
+
     fn sync_content_from_selection(&mut self) {
         if self.release_note_active {
             return;
@@ -11763,24 +11793,17 @@ impl Model {
 
     fn resolve_media_origin(&self, layout: MediaLayout) -> Option<MediaOrigin> {
         let area = self.content_area?;
-        let content_width = area.width.saturating_sub(layout.indent).max(1);
-        let lines = &self.content.lines;
-        let line_offset = layout.line_offset.min(lines.len());
-        let scroll_lines = self.content_scroll as usize;
-        let visual_offset = visual_height(&lines[..line_offset], content_width);
-        let visual_scroll = visual_height(&lines[..scroll_lines.min(lines.len())], content_width);
-
-        if visual_offset < visual_scroll {
-            return None;
-        }
-
-        let relative_row = visual_offset - visual_scroll;
-        if relative_row >= area.height as usize {
-            return None;
-        }
+        let visual_scroll = self.content_scroll as usize;
+        let (visual_offset, relative_row) = media_row(
+            &self.content.lines,
+            layout.line_offset,
+            visual_scroll,
+            area.width,
+            area.height,
+        )?;
 
         Some(MediaOrigin {
-            row: area.y + relative_row as u16,
+            row: area.y + relative_row,
             col: area.x.saturating_add(layout.indent),
             visual_scroll,
             visual_offset,
@@ -14204,6 +14227,50 @@ fn pane_constraints(panes: &[Pane; 3]) -> [Constraint; 3] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gallery_digits_pick_images() {
+        // 1-9 map to that image when it exists.
+        assert_eq!(gallery_digit_target(1, 3, 4), Some(0));
+        assert_eq!(gallery_digit_target(4, 0, 4), Some(3));
+        assert_eq!(gallery_digit_target(5, 0, 4), None);
+        // 0 needs a tenth image.
+        assert_eq!(gallery_digit_target(0, 0, 9), None);
+        // 0 jumps to the tenth, then walks 11, 12, ... and wraps to the tenth.
+        assert_eq!(gallery_digit_target(0, 2, 13), Some(9));
+        assert_eq!(gallery_digit_target(0, 9, 13), Some(10));
+        assert_eq!(gallery_digit_target(0, 11, 13), Some(12));
+        assert_eq!(gallery_digit_target(0, 12, 13), Some(9));
+        assert_eq!(gallery_digit_target(0, 9, 10), Some(9));
+    }
+
+    #[test]
+    fn media_row_scrolls_in_wrapped_rows() {
+        // Two long lines that wrap to 3 rows each at width 10, then the media.
+        let long = "word ".repeat(6);
+        let lines = vec![
+            Line::from(long.clone()),
+            Line::from(long),
+            Line::from("          "),
+        ];
+        let before = wrapped_height(&lines[..2], 10);
+        assert!(before > 2, "lines must wrap for this test");
+        // Unscrolled: the media sits right below the wrapped text.
+        assert_eq!(
+            media_row(&lines, 2, 0, 10, 20),
+            Some((before, before as u16))
+        );
+        // Each scrolled row moves it up by exactly one row.
+        for scroll in 1..=before {
+            assert_eq!(
+                media_row(&lines, 2, scroll, 10, 20),
+                Some((before, (before - scroll) as u16))
+            );
+        }
+        // Scrolled past its top, or below the pane: not placed.
+        assert_eq!(media_row(&lines, 2, before + 1, 10, 20), None);
+        assert_eq!(media_row(&lines, 2, 0, 10, before as u16), None);
+    }
+
     fn sample_gif(frames: u8) -> Vec<u8> {
         use image::codecs::gif::GifEncoder;
         use image::{Delay, Frame, Rgba, RgbaImage};

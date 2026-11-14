@@ -533,6 +533,15 @@ pub struct Post {
 }
 
 impl Post {
+    /// The post's own preview followed by those of its crosspost parents.
+    pub fn previews(&self) -> impl Iterator<Item = &Preview> + Clone {
+        std::iter::once(&self.preview).chain(
+            self.crosspost_parent_list
+                .iter()
+                .map(|parent| &parent.preview),
+        )
+    }
+
     pub fn created_at(&self) -> Option<SystemTime> {
         if self.created_utc == 0.0 {
             return None;

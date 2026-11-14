@@ -193,52 +193,50 @@ pub fn find_video_source(post: &reddit::Post) -> Option<VideoSource> {
 
 /// Animated GIF posts: Reddit's own mp4 rendition first, then the linked file.
 fn gif_source(post: &reddit::Post) -> Option<VideoSource> {
-    let label = || {
-        if post.title.trim().is_empty() {
-            "GIF".to_string()
-        } else {
-            post.title.trim().to_string()
-        }
-    };
-    let previews = std::iter::once(&post.preview).chain(
-        post.crosspost_parent_list
-            .iter()
-            .map(|parent| &parent.preview),
-    );
-
-    for preview in previews.clone() {
-        if let Some(video) = &preview.reddit_video_preview {
-            if let Some(mut source) = VideoSource::from_reddit_video(video, label().into()) {
-                source.is_gif = true;
-                return Some(source);
-            }
-        }
-    }
-    for preview in previews {
-        for image in &preview.images {
-            if let Some(variant) = image.variants.get("mp4") {
-                let url = sanitize_url(&variant.source.url);
-                if !url.is_empty() {
-                    return Some(VideoSource {
-                        playback_url: url,
-                        label: label(),
-                        is_gif: true,
-                        width: some_positive(variant.source.width),
-                        height: some_positive(variant.source.height),
-                    });
-                }
-            }
-        }
-    }
-
-    let url = direct_gif_url(&post.url)?;
-    Some(VideoSource {
-        playback_url: url,
+    let label = || source_label(&post.title, "GIF").into_owned();
+    let gif = |playback_url: String, width: Option<i64>, height: Option<i64>| VideoSource {
+        playback_url,
         label: label(),
         is_gif: true,
-        width: None,
-        height: None,
-    })
+        width,
+        height,
+    };
+
+    let reddit_rendition = post.previews().find_map(|preview| {
+        let video = preview.reddit_video_preview.as_ref()?;
+        let source = VideoSource::from_reddit_video(video, source_label(&post.title, "GIF"))?;
+        Some(VideoSource {
+            is_gif: true,
+            ..source
+        })
+    });
+    let mp4_variant = || {
+        post.previews()
+            .flat_map(|preview| &preview.images)
+            .filter_map(|image| image.variants.get("mp4"))
+            .find_map(|variant| {
+                let url = sanitize_url(&variant.source.url);
+                (!url.is_empty()).then(|| {
+                    gif(
+                        url,
+                        some_positive(variant.source.width),
+                        some_positive(variant.source.height),
+                    )
+                })
+            })
+    };
+
+    reddit_rendition
+        .or_else(mp4_variant)
+        .or_else(|| direct_gif_url(&post.url).map(|url| gif(url, None, None)))
+}
+
+/// The post title, or `fallback` when it is blank.
+fn source_label<'a>(title: &'a str, fallback: &'static str) -> Cow<'a, str> {
+    match title.trim() {
+        "" => Cow::Borrowed(fallback),
+        trimmed => Cow::Borrowed(trimmed),
+    }
 }
 
 /// Direct GIF links mpv can play. imgur's `.gifv` is an HTML page; its mp4
@@ -260,12 +258,7 @@ fn direct_gif_url(raw: &str) -> Option<String> {
 fn video_from_media(media: Option<&PostMedia>, title: &str) -> Option<VideoSource> {
     let media = media?;
     let video = media.reddit_video.as_ref()?;
-    let label = if title.trim().is_empty() {
-        Cow::Borrowed("Reddit video")
-    } else {
-        Cow::Owned(title.trim().to_string())
-    };
-    VideoSource::from_reddit_video(video, label)
+    VideoSource::from_reddit_video(video, source_label(title, "Reddit video"))
 }
 
 pub struct InlineLaunchOptions<'a> {

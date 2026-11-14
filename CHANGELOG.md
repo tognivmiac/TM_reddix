@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 - Nothing yet.
 
+## [0.2.9+tm.20261114] - 2026-11-14
+### Added
+- Gallery images can be picked with the digit keys while the content pane has focus: `1`-`9` show that image, `0` goes to the tenth and steps on through the rest (wrapping back to the tenth).
+### Fixed
+- Inline images, GIFs and video no longer drift up into the text above them in the content pane. Their row is now computed from the rows ratatui actually wraps the text to, and the scroll offset is counted in wrapped rows.
+- The content pane keeps its scroll position when you switch gallery images or when a preview finishes loading; it used to jump back to the top.
+
 ## [0.2.9+tm.20261113] - 2026-11-13
 Personal fork build on top of upstream 0.2.9. Fork builds keep the upstream base version and append `+tm.<YYYYMMDD>`, the build date in UTC.
 ### Added

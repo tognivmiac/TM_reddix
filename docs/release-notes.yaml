@@ -1,4 +1,13 @@
 release:
+  - version: "0.2.9+tm.20261114"
+    title: "What's new in v0.2.9+tm.20261114 (personal fork)"
+    banner: "Fork build: gallery digit keys and steadier inline media."
+    summary: "Pick gallery images with the digit keys, and inline media stays where it belongs while you scroll."
+    url: "https://github.com/tognivmiac/TM_reddix"
+    details:
+      - "Gallery: 1-9 pick an image from the content pane; 0 steps through the 10th and later."
+      - "Switching gallery images, or a preview finishing loading, no longer jumps the content pane back to the top."
+      - "Inline images, GIFs and video no longer drift up into the text above them when the text wraps."
   - version: "0.2.9+tm.20261113"
     title: "What's new in v0.2.9+tm.20261113 (personal fork)"
     banner: "Fork build: user pages, vim-style paging and the 403 feed fix."
