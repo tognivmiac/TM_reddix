@@ -1,11 +1,11 @@
 [package]
 name = "reddix"
 version = "0.2.9+tm.20261114"
-edition = "2021"
+edition = "2024"
+rust-version = "1.100"
 license = "MIT"
 description = "Reddix - Reddit, refined for the terminal."
 repository = "https://github.com/ck-zhang/reddix"
-homepage = "https://github.com/ck-zhang/reddix"
 
 # The command is `redx` in this fork; the package, library crate and the
 # config/cache directories keep the `reddix` name.
@@ -31,7 +31,6 @@ tiny_http = "0.12"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
 parking_lot = "0.12"
-once_cell = "1.19"
 pulldown-cmark = "0.10"
 ratatui = { version = "0.26", features = ["unstable-rendered-line-info"] }
 crossterm = "0.27"

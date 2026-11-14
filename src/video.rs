@@ -6,20 +6,19 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
-use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
-use once_cell::sync::OnceCell;
+use anyhow::{Context, Result, anyhow};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use serde_json::json;
 
 #[cfg(any(unix, target_os = "windows"))]
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{Rng, distributions::Alphanumeric};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 
 use crate::reddit::{self, PostMedia, RedditVideo};
 
 fn video_debug_enabled() -> bool {
-    static FLAG: OnceCell<bool> = OnceCell::new();
+    static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
         std::env::var("REDDIX_DEBUG_VIDEO")
             .map(|val| {
@@ -35,7 +34,7 @@ fn video_debug_enabled() -> bool {
 }
 
 fn video_debug_writer() -> Option<&'static Mutex<std::fs::File>> {
-    static WRITER: OnceCell<Option<Mutex<std::fs::File>>> = OnceCell::new();
+    static WRITER: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
     WRITER
         .get_or_init(|| {
             std::env::var("REDDIX_DEBUG_VIDEO_LOG")
@@ -56,11 +55,11 @@ pub fn debug_log(message: impl AsRef<str>) {
     if !video_debug_enabled() {
         return;
     }
-    if let Some(writer) = video_debug_writer() {
-        if let Ok(mut file) = writer.lock() {
-            let _ = writeln!(file, "{}", message.as_ref());
-            return;
-        }
+    if let Some(writer) = video_debug_writer()
+        && let Ok(mut file) = writer.lock()
+    {
+        let _ = writeln!(file, "{}", message.as_ref());
+        return;
     }
     eprintln!("{}", message.as_ref());
 }
@@ -106,11 +105,7 @@ impl VideoSource {
 }
 
 fn some_positive(value: i64) -> Option<i64> {
-    if value > 0 {
-        Some(value)
-    } else {
-        None
-    }
+    if value > 0 { Some(value) } else { None }
 }
 
 fn sanitize_url(raw: &str) -> String {
@@ -372,12 +367,12 @@ pub fn spawn_inline_player(opts: InlineLaunchOptions<'_>) -> Result<InlineSessio
         ipc_path.as_deref().unwrap_or("n/a")
     ));
     #[cfg(unix)]
-    if let Some(path) = &ipc_path {
-        if let Err(err) = fs::remove_file(path) {
-            if err.kind() != std::io::ErrorKind::NotFound && video_debug_enabled() {
-                debug_log(format!("failed to remove stale mpv ipc path {path}: {err}"));
-            }
-        }
+    if let Some(path) = &ipc_path
+        && let Err(err) = fs::remove_file(path)
+        && err.kind() != std::io::ErrorKind::NotFound
+        && video_debug_enabled()
+    {
+        debug_log(format!("failed to remove stale mpv ipc path {path}: {err}"));
     }
     let ipc_arg = ipc_path
         .as_ref()
@@ -461,15 +456,13 @@ pub fn spawn_inline_player(opts: InlineLaunchOptions<'_>) -> Result<InlineSessio
                 .spawn()
                 .with_context(|| format!("launch mpv to play {}", remote_url))?;
             let mut stderr_handle = None;
-            if debug_enabled {
-                if let Some(stderr) = child.stderr.take() {
-                    stderr_handle = Some(thread::spawn(move || {
-                        let reader = BufReader::new(stderr);
-                        for line in reader.lines().map_while(Result::ok) {
-                            debug_log(format!("mpv stderr: {}", line));
-                        }
-                    }));
-                }
+            if debug_enabled && let Some(stderr) = child.stderr.take() {
+                stderr_handle = Some(thread::spawn(move || {
+                    let reader = BufReader::new(stderr);
+                    for line in reader.lines().map_while(Result::ok) {
+                        debug_log(format!("mpv stderr: {}", line));
+                    }
+                }));
             }
 
             loop {
@@ -657,10 +650,11 @@ fn unique_ipc_path() -> Option<String> {
 
 #[cfg(unix)]
 fn cleanup_ipc_path(path: &str) {
-    if let Err(err) = fs::remove_file(path) {
-        if err.kind() != std::io::ErrorKind::NotFound && video_debug_enabled() {
-            debug_log(format!("failed to remove mpv ipc path {path}: {err}"));
-        }
+    if let Err(err) = fs::remove_file(path)
+        && err.kind() != std::io::ErrorKind::NotFound
+        && video_debug_enabled()
+    {
+        debug_log(format!("failed to remove mpv ipc path {path}: {err}"));
     }
 }
 

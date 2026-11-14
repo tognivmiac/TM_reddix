@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Reddix is a Rust terminal Reddit client (ratatui + crossterm) with inline image previews via the kitty graphics protocol and video playback via mpv. Single crate, binary + library (`src/main.rs` is a thin CLI-flag shim over `reddix::run()` in `src/app.rs`). This is a private personal fork: the installed command is `redx` (`[[bin]]` in `Cargo.toml`, `BIN_NAME` in `src/lib.rs`), while the package, library crate and config/cache directories keep the `reddix` name. Install with `cargo install --path . --locked`. Fork versions are `<upstream base>+tm.<YYYYMMDD>` with the date in UTC (`date -u +%Y%m%d`); bump `Cargo.toml`, `CHANGELOG.md` and `docs/release-notes.yaml` together.
+Reddix is a Rust terminal Reddit client (ratatui + crossterm) with inline image previews via the kitty graphics protocol and video playback via mpv. Single crate (Rust 2024 edition, `rust-version = "1.100"`), binary + library (`src/main.rs` is a thin CLI-flag shim over `reddix::run()` in `src/app.rs`). This is a private personal fork: the installed command is `redx` (`[[bin]]` in `Cargo.toml`, `BIN_NAME` in `src/lib.rs`), while the package, library crate and config/cache directories keep the `reddix` name. Install with `cargo install --path . --locked`. Fork versions are `<upstream base>+tm.<YYYYMMDD>` with the date in UTC (`date -u +%Y%m%d`); bump `Cargo.toml`, `CHANGELOG.md` and `docs/release-notes.yaml` together.
 
 ## Commands
 

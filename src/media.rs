@@ -1,14 +1,14 @@
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use image::ImageFormat;
 use parking_lot::Mutex;
 use reqwest::blocking::Client;
@@ -247,13 +247,12 @@ impl Inner {
             return Err(anyhow!("media: url required"));
         }
 
-        if let Some(entry) = self.store.get_media_entry_by_url(&request.url)? {
-            if !request.force
-                && self.is_fresh(&entry, request.ttl)
-                && Path::new(&entry.file_path).exists()
-            {
-                return Ok(entry);
-            }
+        if let Some(entry) = self.store.get_media_entry_by_url(&request.url)?
+            && !request.force
+            && self.is_fresh(&entry, request.ttl)
+            && Path::new(&entry.file_path).exists()
+        {
+            return Ok(entry);
         }
 
         let response = self

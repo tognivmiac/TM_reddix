@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -8,8 +8,8 @@ use std::io::{self, Cursor, Read, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::{
+    Arc, LazyLock, OnceLock,
     atomic::{AtomicBool, Ordering},
-    Arc, OnceLock,
 };
 
 #[cfg(unix)]
@@ -17,9 +17,10 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use arboard::Clipboard;
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossterm::ExecutableCommand;
 use crossterm::cursor::MoveTo;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -27,11 +28,9 @@ use crossterm::event::{
 };
 use crossterm::style::Print;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, window_size, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, window_size,
 };
-use crossterm::ExecutableCommand;
 use image::{self, ImageFormat};
-use once_cell::sync::Lazy;
 use percent_encoding::percent_decode_str;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -41,16 +40,16 @@ use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
 };
 use ratatui::{Frame, Terminal};
-use reqwest::{blocking::Client, header::CONTENT_TYPE, Error as ReqwestError};
+use reqwest::{Error as ReqwestError, blocking::Client, header::CONTENT_TYPE};
 use semver::Version;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use url::Url;
 
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
-use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
+use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use regex::{Captures, Regex};
-use textwrap::{wrap, Options as WrapOptions};
+use textwrap::{Options as WrapOptions, wrap};
 
 use crate::auth;
 use crate::config;
@@ -106,11 +105,7 @@ fn likes_from_vote(vote: i32) -> Option<bool> {
 }
 
 fn toggle_vote_value(old: i32, requested: i32) -> i32 {
-    if old == requested {
-        0
-    } else {
-        requested
-    }
+    if old == requested { 0 } else { requested }
 }
 
 const NAV_SORTS: [reddit::SortOption; 5] = [
@@ -141,7 +136,7 @@ const ICON_COMMENTS: &str = "";
 const ICON_SUBREDDIT: &str = "";
 const ICON_USER: &str = "";
 
-static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
+static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
     Client::builder()
         .timeout(Duration::from_secs(10))
         .user_agent("reddix/0.1 (kitty-preview)")
@@ -575,10 +570,10 @@ impl KittyImage {
     }
 
     fn start_animation(&mut self, now: Instant) {
-        if let Some(animation) = &mut self.animation {
-            if animation.next_at.is_none() {
-                animation.next_at = Some(now + animation.delays[animation.current]);
-            }
+        if let Some(animation) = &mut self.animation
+            && animation.next_at.is_none()
+        {
+            animation.next_at = Some(now + animation.delays[animation.current]);
         }
     }
 
@@ -2228,24 +2223,22 @@ fn load_media_preview(
         max_rows.clamp(1, MAX_IMAGE_ROWS)
     };
 
-    if gallery.is_none() {
-        if let Some(source) = select_gif_source(post) {
-            match load_gif_preview(
-                theme,
-                post,
-                &source,
-                cancel_flag,
-                media_handle.clone(),
-                (capped_cols, capped_rows),
-                allow_upscale,
-                priority,
-            ) {
-                Ok(outcome) => return Ok(outcome),
-                // Not decodable (or single frame): fall back to mpv / still image.
-                Err(err) => {
-                    video::debug_log(format!("gif preview failed for {}: {err:#}", post.name))
-                }
-            }
+    if gallery.is_none()
+        && let Some(source) = select_gif_source(post)
+    {
+        match load_gif_preview(
+            theme,
+            post,
+            &source,
+            cancel_flag,
+            media_handle.clone(),
+            (capped_cols, capped_rows),
+            allow_upscale,
+            priority,
+        ) {
+            Ok(outcome) => return Ok(outcome),
+            // Not decodable (or single frame): fall back to mpv / still image.
+            Err(err) => video::debug_log(format!("gif preview failed for {}: {err:#}", post.name)),
         }
     }
 
@@ -2255,37 +2248,35 @@ fn load_media_preview(
         video::find_video_source(post)
     };
 
-    if allow_inline_video {
-        if let Some(video_source) = video_source.clone() {
-            let width_px = video_source.width.unwrap_or(TARGET_PREVIEW_WIDTH_PX);
-            let height_px = video_source.height.unwrap_or(((width_px * 9) / 16).max(1));
-            let (cols, rows) =
-                clamp_dimensions(width_px, height_px, capped_cols, capped_rows, allow_upscale);
-            let limited_cols = cols >= capped_cols && (width_px as i32) > capped_cols;
-            let limited_rows = rows >= capped_rows && (height_px as i32) > capped_rows;
-            let label = if video_source.label.trim().is_empty() {
-                "video"
-            } else {
-                video_source.label.trim()
-            };
-            video::debug_log(format!(
-                "resolved post={} url={} width={} height={} cols={} rows={}",
-                post.name, video_source.playback_url, width_px, height_px, cols, rows
-            ));
-            let placeholder = kitty_placeholder_text(theme, cols, rows, MEDIA_INDENT, label);
-            return Ok(MediaLoadOutcome::Ready(MediaPreview {
-                placeholder,
-                kitty: None,
-                cols,
-                rows,
-                limited_cols,
-                limited_rows,
-                video: Some(VideoPreview {
-                    source: video_source,
-                }),
-                gallery: None,
-            }));
-        }
+    if allow_inline_video && let Some(video_source) = video_source.clone() {
+        let width_px = video_source.width.unwrap_or(TARGET_PREVIEW_WIDTH_PX);
+        let height_px = video_source.height.unwrap_or(((width_px * 9) / 16).max(1));
+        let (cols, rows) =
+            clamp_dimensions(width_px, height_px, capped_cols, capped_rows, allow_upscale);
+        let limited_cols = cols >= capped_cols && (width_px as i32) > capped_cols;
+        let limited_rows = rows >= capped_rows && (height_px as i32) > capped_rows;
+        let label = if video_source.label.trim().is_empty() {
+            "video"
+        } else {
+            video_source.label.trim()
+        };
+        video::debug_log(format!(
+            "resolved post={} url={} width={} height={} cols={} rows={}",
+            post.name, video_source.playback_url, width_px, height_px, cols, rows
+        ));
+        let placeholder = kitty_placeholder_text(theme, cols, rows, MEDIA_INDENT, label);
+        return Ok(MediaLoadOutcome::Ready(MediaPreview {
+            placeholder,
+            kitty: None,
+            cols,
+            rows,
+            limited_cols,
+            limited_rows,
+            video: Some(VideoPreview {
+                source: video_source,
+            }),
+            gallery: None,
+        }));
     }
 
     let video_preview = video_source.map(|source| VideoPreview { source });
@@ -3018,11 +3009,11 @@ fn wrap_plain(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
 }
 
 fn scrub_links(text: &str) -> (String, Vec<String>) {
-    static MARKDOWN_LINK_RE: Lazy<Regex> = Lazy::new(|| {
+    static MARKDOWN_LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?i)\[([^\]]+)\]\((https?://[^\s)]+)\)").expect("valid markdown link regex")
     });
-    static BARE_URL_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"(?i)https?://[^\s)]+").expect("valid bare url regex"));
+    static BARE_URL_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)https?://[^\s)]+").expect("valid bare url regex"));
 
     if text.trim().is_empty() {
         return (text.to_string(), Vec::new());
@@ -3228,10 +3219,10 @@ fn gallery_items_from_post(post: &reddit::Post) -> Vec<GalleryItem> {
     };
 
     for item in &gallery.items {
-        if let Some(entry) = metadata.get(&item.media_id) {
-            if let Some(gallery_item) = gallery_item_from_metadata(entry) {
-                items.push(gallery_item);
-            }
+        if let Some(entry) = metadata.get(&item.media_id)
+            && let Some(gallery_item) = gallery_item_from_metadata(entry)
+        {
+            items.push(gallery_item);
         }
     }
 
@@ -3309,27 +3300,11 @@ fn build_gallery_state(post: &reddit::Post) -> Option<GalleryState> {
 fn collect_high_res_media(post: &reddit::Post) -> Vec<DownloadCandidate> {
     let mut candidates = Vec::new();
 
-    if let Some(gallery) = &post.gallery_data {
-        if let Some(metadata) = &post.media_metadata {
-            for item in &gallery.items {
-                if let Some(entry) = metadata.get(&item.media_id) {
-                    if entry.status.eq_ignore_ascii_case("failed") {
-                        continue;
-                    }
-                    if let Some(url) = preferred_media_metadata_url(entry) {
-                        candidates.push(DownloadCandidate {
-                            url: url.clone(),
-                            suggested_name: image_label(&url),
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    if candidates.is_empty() {
-        if let Some(metadata) = &post.media_metadata {
-            for entry in metadata.values() {
+    if let Some(gallery) = &post.gallery_data
+        && let Some(metadata) = &post.media_metadata
+    {
+        for item in &gallery.items {
+            if let Some(entry) = metadata.get(&item.media_id) {
                 if entry.status.eq_ignore_ascii_case("failed") {
                     continue;
                 }
@@ -3343,13 +3318,29 @@ fn collect_high_res_media(post: &reddit::Post) -> Vec<DownloadCandidate> {
         }
     }
 
-    if candidates.is_empty() {
-        if let Some(url) = select_full_image_source(post) {
-            candidates.push(DownloadCandidate {
-                url: url.clone(),
-                suggested_name: image_label(&url),
-            });
+    if candidates.is_empty()
+        && let Some(metadata) = &post.media_metadata
+    {
+        for entry in metadata.values() {
+            if entry.status.eq_ignore_ascii_case("failed") {
+                continue;
+            }
+            if let Some(url) = preferred_media_metadata_url(entry) {
+                candidates.push(DownloadCandidate {
+                    url: url.clone(),
+                    suggested_name: image_label(&url),
+                });
+            }
         }
+    }
+
+    if candidates.is_empty()
+        && let Some(url) = select_full_image_source(post)
+    {
+        candidates.push(DownloadCandidate {
+            url: url.clone(),
+            suggested_name: image_label(&url),
+        });
     }
 
     if let Some(video_source) = video::find_video_source(post) {
@@ -3528,21 +3519,19 @@ fn download_high_res_media(url: &str, suggested_name: &str, dest_dir: &Path) -> 
     }
 
     let mut file_name = safe_file_name(suggested_name);
-    if Path::new(&file_name).extension().is_none() {
-        if let Some(ext) = content_type
+    if Path::new(&file_name).extension().is_none()
+        && let Some(ext) = content_type
             .as_deref()
             .and_then(extension_from_content_type)
-        {
-            file_name = format!("{file_name}.{ext}");
-        }
+    {
+        file_name = format!("{file_name}.{ext}");
     }
 
-    if Path::new(&file_name).extension().is_none() {
-        if let Ok(format) = image::guess_format(&bytes) {
-            if let Some(ext) = image_format_extension(format) {
-                file_name = format!("{file_name}.{ext}");
-            }
-        }
+    if Path::new(&file_name).extension().is_none()
+        && let Ok(format) = image::guess_format(&bytes)
+        && let Some(ext) = image_format_extension(format)
+    {
+        file_name = format!("{file_name}.{ext}");
     }
 
     if Path::new(&file_name).extension().is_none() {
@@ -4358,10 +4347,10 @@ impl Model {
             }
             return format!("v{} (installing update…)", self.current_version);
         }
-        if let Some(update) = &self.update_notice {
-            if update.version > self.current_version {
-                return format!("v{} → v{} available", self.current_version, update.version);
-            }
+        if let Some(update) = &self.update_notice
+            && update.version > self.current_version
+        {
+            return format!("v{} → v{} available", self.current_version, update.version);
         }
         if let Some(latest) = &self.latest_known_version {
             if latest > &self.current_version {
@@ -4638,11 +4627,11 @@ impl Model {
         &mut self,
         key: &CommentCacheKey,
     ) -> Option<&mut CommentCacheEntry> {
-        if let Some(entry) = self.comment_cache.get(key) {
-            if entry.scope != self.cache_scope {
-                self.comment_cache.remove(key);
-                return None;
-            }
+        if let Some(entry) = self.comment_cache.get(key)
+            && entry.scope != self.cache_scope
+        {
+            self.comment_cache.remove(key);
+            return None;
         }
         self.comment_cache.get_mut(key)
     }
@@ -4730,12 +4719,11 @@ impl Model {
     }
     fn mark_dirty(&mut self) {
         self.needs_redraw = true;
-        if let Some(post) = self.posts.get(self.selected_post) {
-            if let Some(preview) = self.media_previews.get(&post.post.name) {
-                if preview.has_kitty() {
-                    self.needs_kitty_flush = true;
-                }
-            }
+        if let Some(post) = self.posts.get(self.selected_post)
+            && let Some(preview) = self.media_previews.get(&post.post.name)
+            && preview.has_kitty()
+        {
+            self.needs_kitty_flush = true;
         }
     }
 
@@ -4849,23 +4837,22 @@ impl Model {
     /// the post); otherwise their frames stay cached for the next placement.
     fn prepare_active_kitty_delete(&mut self, free: bool) -> Option<String> {
         let active = self.active_kitty.take()?;
-        if let Some(preview) = self.media_previews.get_mut(&active.post_name) {
-            if let Some(kitty) = preview.kitty_mut() {
-                if kitty.id == active.image_id {
-                    if kitty.is_animated() {
-                        if free {
-                            kitty.transmitted = false;
-                            return Some(kitty.free_sequence());
-                        }
-                        return Some(kitty.delete_sequence());
-                    }
-                    if !kitty.transmitted {
-                        return None;
-                    }
+        if let Some(preview) = self.media_previews.get_mut(&active.post_name)
+            && let Some(kitty) = preview.kitty_mut()
+            && kitty.id == active.image_id
+        {
+            if kitty.is_animated() {
+                if free {
                     kitty.transmitted = false;
-                    return Some(kitty.delete_sequence());
+                    return Some(kitty.free_sequence());
                 }
+                return Some(kitty.delete_sequence());
             }
+            if !kitty.transmitted {
+                return None;
+            }
+            kitty.transmitted = false;
+            return Some(kitty.delete_sequence());
         }
         if active.frames > 1 {
             return Some(KittyImage::free_frames_sequence(
@@ -5152,20 +5139,20 @@ impl Model {
             model.content_source = model.fallback_source.clone();
         }
 
-        if opts.fetch_subreddits_on_start {
-            if let Err(err) = model.reload_subreddits() {
-                model.status_message = format!("Failed to refresh subreddits: {err}");
-            }
+        if opts.fetch_subreddits_on_start
+            && let Err(err) = model.reload_subreddits()
+        {
+            model.status_message = format!("Failed to refresh subreddits: {err}");
         }
 
         if let Some(note) = model.release_note.clone() {
             let mut should_announce = true;
             match model.store.last_seen_release_version() {
                 Ok(Some(raw)) => {
-                    if let Ok(seen) = Version::parse(raw.trim()) {
-                        if seen >= note.version {
-                            should_announce = false;
-                        }
+                    if let Ok(seen) = Version::parse(raw.trim())
+                        && seen >= note.version
+                    {
+                        should_announce = false;
                     }
                 }
                 Ok(None) => {}
@@ -5387,13 +5374,12 @@ impl Model {
             self.numeric_jump = None;
         }
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            if let KeyCode::Char(ch) = code {
-                if self.handle_ctrl_shortcut(ch.to_ascii_lowercase())? {
-                    self.mark_dirty();
-                    return Ok(false);
-                }
-            }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && let KeyCode::Char(ch) = code
+            && self.handle_ctrl_shortcut(ch.to_ascii_lowercase())?
+        {
+            self.mark_dirty();
+            return Ok(false);
         }
 
         match code {
@@ -5524,11 +5510,12 @@ impl Model {
                 }
             }
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if self.focused_pane == Pane::Comments && !self.comment_sort_selected {
-                    if let Err(err) = self.copy_selected_comment() {
-                        self.status_message = format!("Failed to copy comment: {err}");
-                        self.mark_dirty();
-                    }
+                if self.focused_pane == Pane::Comments
+                    && !self.comment_sort_selected
+                    && let Err(err) = self.copy_selected_comment()
+                {
+                    self.status_message = format!("Failed to copy comment: {err}");
+                    self.mark_dirty();
                 }
             }
             KeyCode::Enter => {
@@ -6202,12 +6189,12 @@ impl Model {
             let selection = self
                 .selected_comment
                 .min(self.visible_comment_indices.len().saturating_sub(1));
-            if let Some(comment_index) = self.visible_comment_indices.get(selection) {
-                if let Some(comment) = self.comments.get(*comment_index) {
-                    for entry in &comment.links {
-                        if seen.insert(entry.url.clone()) {
-                            collected.push(entry.clone());
-                        }
+            if let Some(comment_index) = self.visible_comment_indices.get(selection)
+                && let Some(comment) = self.comments.get(*comment_index)
+            {
+                for entry in &comment.links {
+                    if seen.insert(entry.url.clone()) {
+                        collected.push(entry.clone());
                     }
                 }
             }
@@ -6270,25 +6257,25 @@ impl Model {
         let mut video_exists = false;
         let mut video_ready = false;
         let mut video_pending = false;
-        if !self.banner_selected() {
-            if let Some(post) = self.posts.get(self.selected_post) {
-                if let Some(preview) = self.media_previews.get(&post.post.name) {
-                    if preview.video().is_some() {
-                        video_exists = true;
-                        video_ready = true;
-                    }
-                } else if video::find_video_source(&post.post).is_some() {
+        if !self.banner_selected()
+            && let Some(post) = self.posts.get(self.selected_post)
+        {
+            if let Some(preview) = self.media_previews.get(&post.post.name) {
+                if preview.video().is_some() {
                     video_exists = true;
+                    video_ready = true;
                 }
-                if self
-                    .pending_video
-                    .as_ref()
-                    .is_some_and(|pending| pending.post_name == post.post.name)
-                {
-                    video_exists = true;
-                    video_ready = false;
-                    video_pending = true;
-                }
+            } else if video::find_video_source(&post.post).is_some() {
+                video_exists = true;
+            }
+            if self
+                .pending_video
+                .as_ref()
+                .is_some_and(|pending| pending.post_name == post.post.name)
+            {
+                video_exists = true;
+                video_ready = false;
+                video_pending = true;
             }
         }
 
@@ -6636,10 +6623,8 @@ impl Model {
             )
             .with_description("search")
         });
-        if search_first {
-            if let Some(entry) = search_entry.clone() {
-                push_navigation_entry(&mut matches, &mut seen, entry);
-            }
+        if search_first && let Some(entry) = search_entry.clone() {
+            push_navigation_entry(&mut matches, &mut seen, entry);
         }
 
         let normalized = normalize_subreddit_name(trimmed);
@@ -8341,15 +8326,15 @@ impl Model {
                     // The post did not change, only its media: keep the
                     // reader's scroll position.
                     self.resync_content_keeping_scroll(true);
-                    if let Some(preview) = self.media_previews.get(&post_name) {
-                        if let Some(gallery) = preview.gallery() {
-                            self.status_message = format!(
-                                "Gallery image {}/{} — {}",
-                                gallery.index + 1,
-                                gallery.total,
-                                gallery.label
-                            );
-                        }
+                    if let Some(preview) = self.media_previews.get(&post_name)
+                        && let Some(gallery) = preview.gallery()
+                    {
+                        self.status_message = format!(
+                            "Gallery image {}/{} — {}",
+                            gallery.index + 1,
+                            gallery.total,
+                            gallery.label
+                        );
                     }
                 }
                 self.mark_dirty();
@@ -8526,10 +8511,10 @@ impl Model {
                         self.update_banner_selected = false;
                         self.update_install_finished = false;
                         let mut message = format!("Update check failed: {}", err);
-                        if let Some(network_err) = err.downcast_ref::<ReqwestError>() {
-                            if network_err.is_connect() || network_err.is_timeout() {
-                                message = "Update check skipped: network unavailable.".to_string();
-                            }
+                        if let Some(network_err) = err.downcast_ref::<ReqwestError>()
+                            && (network_err.is_connect() || network_err.is_timeout())
+                        {
+                            message = "Update check skipped: network unavailable.".to_string();
                         }
                         self.status_message = message;
                     }
@@ -8711,21 +8696,20 @@ impl Model {
                             self.ensure_comment_visible();
                             self.mark_dirty();
                         }
-                        if let Some((index, score, likes)) = cache_update {
-                            if let Some(post_name) = self
+                        if let Some((index, score, likes)) = cache_update
+                            && let Some(post_name) = self
                                 .posts
                                 .get(self.selected_post)
                                 .map(|post| post.post.name.clone())
-                            {
-                                let key = CommentCacheKey::new(&post_name, self.comment_sort);
-                                if let Some(cache) = self.scoped_comment_cache_mut(&key) {
-                                    if let Some(entry) = cache.comments.get_mut(index) {
-                                        entry.score = score;
-                                        entry.likes = likes;
-                                        entry.score_hidden = false;
-                                    }
-                                    cache.fetched_at = Instant::now();
+                        {
+                            let key = CommentCacheKey::new(&post_name, self.comment_sort);
+                            if let Some(cache) = self.scoped_comment_cache_mut(&key) {
+                                if let Some(entry) = cache.comments.get_mut(index) {
+                                    entry.score = score;
+                                    entry.likes = likes;
+                                    entry.score_hidden = false;
                                 }
+                                cache.fetched_at = Instant::now();
                             }
                         }
                     }
@@ -8965,31 +8949,30 @@ impl Model {
             updated_comment = Some((entry.score, entry.likes));
         }
 
-        if let Some((score, likes)) = updated_comment {
-            if let Some(post_name) = self
+        if let Some((score, likes)) = updated_comment
+            && let Some(post_name) = self
                 .posts
                 .get(self.selected_post)
                 .map(|post| post.post.name.clone())
+        {
+            let key = CommentCacheKey::new(&post_name, self.comment_sort);
+            let root_offset = if self
+                .comments
+                .first()
+                .is_some_and(|entry| entry.is_post_root)
             {
-                let key = CommentCacheKey::new(&post_name, self.comment_sort);
-                let root_offset = if self
-                    .comments
-                    .first()
-                    .is_some_and(|entry| entry.is_post_root)
-                {
-                    1
-                } else {
-                    0
-                };
-                let cache_index = comment_index.saturating_sub(root_offset);
-                if let Some(cache) = self.scoped_comment_cache_mut(&key) {
-                    if let Some(entry) = cache.comments.get_mut(cache_index) {
-                        entry.score = score;
-                        entry.likes = likes;
-                        entry.score_hidden = false;
-                    }
-                    cache.fetched_at = Instant::now();
+                1
+            } else {
+                0
+            };
+            let cache_index = comment_index.saturating_sub(root_offset);
+            if let Some(cache) = self.scoped_comment_cache_mut(&key) {
+                if let Some(entry) = cache.comments.get_mut(cache_index) {
+                    entry.score = score;
+                    entry.likes = likes;
+                    entry.score_hidden = false;
                 }
+                cache.fetched_at = Instant::now();
             }
         }
 
@@ -9098,17 +9081,16 @@ impl Model {
             });
         }
 
-        if let Some(index) = self.selected_comment_index() {
-            if let Some(comment) = self.comments.get(index) {
-                if !comment.name.trim().is_empty() {
-                    return Ok(CommentTarget::Comment {
-                        post_fullname: post.post.name.clone(),
-                        post_title: post.post.title.clone(),
-                        comment_fullname: comment.name.clone(),
-                        author: comment.author.clone(),
-                    });
-                }
-            }
+        if let Some(index) = self.selected_comment_index()
+            && let Some(comment) = self.comments.get(index)
+            && !comment.name.trim().is_empty()
+        {
+            return Ok(CommentTarget::Comment {
+                post_fullname: post.post.name.clone(),
+                post_title: post.post.title.clone(),
+                comment_fullname: comment.name.clone(),
+                author: comment.author.clone(),
+            });
         }
 
         Ok(CommentTarget::Post {
@@ -9325,11 +9307,11 @@ impl Model {
         self.comments.insert(insert_index, entry);
         self.insert_post_root_comment_placeholder();
 
-        if let Some(post) = self.posts.get_mut(self.selected_post) {
-            if post.post.name == post_name {
-                post.post.num_comments = post.post.num_comments.saturating_add(1);
-                self.post_rows.remove(&post.post.name);
-            }
+        if let Some(post) = self.posts.get_mut(self.selected_post)
+            && post.post.name == post_name
+        {
+            post.post.num_comments = post.post.num_comments.saturating_add(1);
+            self.post_rows.remove(&post.post.name);
         }
 
         self.rebuild_visible_comments_internal(Some(insert_index), false);
@@ -10525,15 +10507,14 @@ impl Model {
     }
 
     fn cache_posts(&mut self, key: FeedCacheKey, batch: PostBatch) {
-        if self.feed_cache.len() >= FEED_CACHE_MAX {
-            if let Some(old_key) = self
+        if self.feed_cache.len() >= FEED_CACHE_MAX
+            && let Some(old_key) = self
                 .feed_cache
                 .iter()
                 .min_by_key(|(_, entry)| entry.fetched_at)
                 .map(|(key, _)| key.clone())
-            {
-                self.feed_cache.remove(&old_key);
-            }
+        {
+            self.feed_cache.remove(&old_key);
         }
         self.feed_cache.insert(
             key,
@@ -10551,15 +10532,14 @@ impl Model {
         sort: reddit::CommentSortOption,
         comments: Vec<CommentEntry>,
     ) {
-        if self.comment_cache.len() >= COMMENT_CACHE_MAX {
-            if let Some(old_key) = self
+        if self.comment_cache.len() >= COMMENT_CACHE_MAX
+            && let Some(old_key) = self
                 .comment_cache
                 .iter()
                 .min_by_key(|(_, entry)| entry.fetched_at)
                 .map(|(key, _)| key.clone())
-            {
-                self.comment_cache.remove(&old_key);
-            }
+        {
+            self.comment_cache.remove(&old_key);
         }
         let key = CommentCacheKey::new(post_name, sort);
         self.comment_cache.insert(
@@ -10593,27 +10573,26 @@ impl Model {
                             sort_label(sort)
                         );
                         handled = true;
-                    } else if !from_cache {
-                        if let Some(fallback) = fallback_feed_target(target) {
-                            if self.select_subreddit_by_name(fallback) {
-                                self.feed_after = None;
-                                let fallback_label = navigation_display_name(fallback);
-                                self.status_message = format!(
-                                    "No posts available for {} ({}) — loading {} instead...",
-                                    label,
-                                    sort_label(sort),
-                                    fallback_label
-                                );
-                                if let Err(err) = self.reload_posts() {
-                                    self.status_message = format!(
-                                        "Tried {}, but failed to load posts: {}",
-                                        fallback_label, err
-                                    );
-                                }
-                                self.mark_dirty();
-                                return;
-                            }
+                    } else if !from_cache
+                        && let Some(fallback) = fallback_feed_target(target)
+                        && self.select_subreddit_by_name(fallback)
+                    {
+                        self.feed_after = None;
+                        let fallback_label = navigation_display_name(fallback);
+                        self.status_message = format!(
+                            "No posts available for {} ({}) — loading {} instead...",
+                            label,
+                            sort_label(sort),
+                            fallback_label
+                        );
+                        if let Err(err) = self.reload_posts() {
+                            self.status_message = format!(
+                                "Tried {}, but failed to load posts: {}",
+                                fallback_label, err
+                            );
                         }
+                        self.mark_dirty();
+                        return;
                     }
 
                     if !handled {
@@ -10905,19 +10884,20 @@ impl Model {
         let sort = self.sort;
         let cache_key = FeedCacheKey::new(&target, sort);
 
-        if let Some(entry) = self.feed_cache.get(&cache_key) {
-            if entry.scope == self.cache_scope && entry.fetched_at.elapsed() < FEED_CACHE_TTL {
-                if let Some(pending) = self.pending_posts.take() {
-                    pending.cancel_flag.store(true, Ordering::SeqCst);
-                }
-                self.pending_posts = None;
-                if let Some(pending) = self.pending_comments.take() {
-                    pending.cancel_flag.store(true, Ordering::SeqCst);
-                }
-                self.apply_posts_batch(&target, sort, entry.batch.clone(), true, LoadMode::Replace);
-                self.mark_dirty();
-                return Ok(());
+        if let Some(entry) = self.feed_cache.get(&cache_key)
+            && entry.scope == self.cache_scope
+            && entry.fetched_at.elapsed() < FEED_CACHE_TTL
+        {
+            if let Some(pending) = self.pending_posts.take() {
+                pending.cancel_flag.store(true, Ordering::SeqCst);
             }
+            self.pending_posts = None;
+            if let Some(pending) = self.pending_comments.take() {
+                pending.cancel_flag.store(true, Ordering::SeqCst);
+            }
+            self.apply_posts_batch(&target, sort, entry.batch.clone(), true, LoadMode::Replace);
+            self.mark_dirty();
+            return Ok(());
         }
 
         if let Some(pending) = self.pending_posts.take() {
@@ -11208,10 +11188,9 @@ impl Model {
                 .as_ref()
                 .map(|pending| pending.post_name != key)
                 .unwrap_or(false)
+                && let Some(pending) = self.pending_content.take()
             {
-                if let Some(pending) = self.pending_content.take() {
-                    pending.cancel_flag.store(true, Ordering::SeqCst);
-                }
+                pending.cancel_flag.store(true, Ordering::SeqCst);
             }
 
             if let Some(cached) = self.content_cache.get(&key).cloned() {
@@ -11346,11 +11325,7 @@ impl Model {
             }
         }
         let total = gallery_items_from_post(&post.post).len();
-        if total >= 2 {
-            Some((0, total))
-        } else {
-            None
-        }
+        if total >= 2 { Some((0, total)) } else { None }
     }
 
     fn gallery_state_for_post(&mut self, post: &reddit::Post) -> Option<&mut GalleryState> {
@@ -11364,10 +11339,10 @@ impl Model {
             self.gallery_states.remove(&key);
         }
 
-        if !self.gallery_states.contains_key(&key) {
-            if let Some(state) = build_gallery_state(post) {
-                self.gallery_states.insert(key.clone(), state);
-            }
+        if !self.gallery_states.contains_key(&key)
+            && let Some(state) = build_gallery_state(post)
+        {
+            self.gallery_states.insert(key.clone(), state);
         }
 
         if self
@@ -11592,51 +11567,52 @@ impl Model {
         let subreddit = post.post.subreddit.clone();
         let article = post.post.id.clone();
         let cache_key = CommentCacheKey::new(&key, self.comment_sort);
-        if let Some(entry) = self.comment_cache.get(&cache_key) {
-            if entry.scope == self.cache_scope && entry.fetched_at.elapsed() < COMMENT_CACHE_TTL {
-                self.comments = entry.comments.clone();
-                self.insert_post_root_comment_placeholder();
-                self.collapsed_comments.clear();
-                self.selected_comment = 0;
-                self.comment_offset.set(0);
-                self.rebuild_visible_comments_reset();
-                let real_total = self
-                    .comments
+        if let Some(entry) = self.comment_cache.get(&cache_key)
+            && entry.scope == self.cache_scope
+            && entry.fetched_at.elapsed() < COMMENT_CACHE_TTL
+        {
+            self.comments = entry.comments.clone();
+            self.insert_post_root_comment_placeholder();
+            self.collapsed_comments.clear();
+            self.selected_comment = 0;
+            self.comment_offset.set(0);
+            self.rebuild_visible_comments_reset();
+            let real_total = self
+                .comments
+                .iter()
+                .filter(|entry| !entry.is_post_root)
+                .count();
+            if real_total == 0 {
+                self.comment_status = format!(
+                    "No comments yet. (cached · sorted by {})",
+                    comment_sort_label(self.comment_sort)
+                );
+            } else {
+                let visible = self
+                    .visible_comment_indices
                     .iter()
-                    .filter(|entry| !entry.is_post_root)
+                    .filter(|idx| {
+                        self.comments
+                            .get(**idx)
+                            .is_some_and(|entry| !entry.is_post_root)
+                    })
                     .count();
-                if real_total == 0 {
+                if visible == real_total {
                     self.comment_status = format!(
-                        "No comments yet. (cached · sorted by {})",
+                        "{real_total} comments loaded (cached · sorted by {})",
                         comment_sort_label(self.comment_sort)
                     );
                 } else {
-                    let visible = self
-                        .visible_comment_indices
-                        .iter()
-                        .filter(|idx| {
-                            self.comments
-                                .get(**idx)
-                                .is_some_and(|entry| !entry.is_post_root)
-                        })
-                        .count();
-                    if visible == real_total {
-                        self.comment_status = format!(
-                            "{real_total} comments loaded (cached · sorted by {})",
-                            comment_sort_label(self.comment_sort)
-                        );
-                    } else {
-                        let hidden = real_total.saturating_sub(visible);
-                        self.comment_status = format!(
-                            "{real_total} comments loaded (cached · sorted by {}) · {visible} visible · {hidden} hidden",
-                            comment_sort_label(self.comment_sort)
-                        );
-                    }
+                    let hidden = real_total.saturating_sub(visible);
+                    self.comment_status = format!(
+                        "{real_total} comments loaded (cached · sorted by {}) · {visible} visible · {hidden} hidden",
+                        comment_sort_label(self.comment_sort)
+                    );
                 }
-                self.pending_comments = None;
-                self.close_action_menu(None);
-                return Ok(());
             }
+            self.pending_comments = None;
+            self.close_action_menu(None);
+            return Ok(());
         }
 
         if let Some(pending) = self.pending_comments.take() {
@@ -12299,10 +12275,8 @@ impl Model {
             self.mark_dirty();
             true
         } else {
-            if !silent {
-                if let Some(msg) = message {
-                    self.status_message = msg.to_string();
-                }
+            if !silent && let Some(msg) = message {
+                self.status_message = msg.to_string();
             }
             false
         }
@@ -12310,18 +12284,18 @@ impl Model {
 
     fn poll_active_video(&mut self) {
         let mut finished: Option<VideoCompletion> = None;
-        if let Some(active) = self.active_video.as_mut() {
-            if let Some(result) = active.try_status() {
-                finished = Some(VideoCompletion {
-                    post_name: active.post_name.clone(),
-                    result,
-                    label: active.source.label.clone(),
-                    row: active.row,
-                    col: active.col,
-                    cols: active.cols,
-                    rows: active.rows,
-                });
-            }
+        if let Some(active) = self.active_video.as_mut()
+            && let Some(result) = active.try_status()
+        {
+            finished = Some(VideoCompletion {
+                post_name: active.post_name.clone(),
+                result,
+                label: active.source.label.clone(),
+                row: active.row,
+                col: active.col,
+                cols: active.cols,
+                rows: active.rows,
+            });
         }
 
         if let Some(VideoCompletion {
@@ -12426,11 +12400,11 @@ impl Model {
             (post.post.name.clone(), dims, video_source, origin)
         };
 
-        if let Some(active) = &self.active_video {
-            if active.matches_geometry(origin.row, origin.col, dims.0, dims.1, &video_source) {
-                self.needs_video_refresh = false;
-                return Ok(());
-            }
+        if let Some(active) = &self.active_video
+            && active.matches_geometry(origin.row, origin.col, dims.0, dims.1, &video_source)
+        {
+            self.needs_video_refresh = false;
+            return Ok(());
         }
 
         if self.pending_video_matches(&post_name, origin, dims, &video_source) {
@@ -13010,10 +12984,10 @@ impl Model {
             return;
         }
 
-        if let Some(pending) = &self.pending_post_rows {
-            if pending.width == width {
-                return;
-            }
+        if let Some(pending) = &self.pending_post_rows
+            && pending.width == width
+        {
+            return;
         }
 
         let request_id = self.next_request_id;
@@ -13732,47 +13706,47 @@ impl Model {
         if positions.release_notes.is_some() && self.release_note.is_some() {
             lines.push(Line::default());
         }
-        if let Some(release_idx) = positions.release_notes {
-            if let Some(note) = &self.release_note {
-                let selected = self.menu_account_index == release_idx;
-                let highlight_unread = self.release_note_unread && !selected;
-                let indicator_style = Style::default().fg(if selected || highlight_unread {
-                    self.theme.accent
-                } else {
-                    self.theme.text_secondary
-                });
-                let mut label_style = Style::default().fg(if selected {
+        if let Some(release_idx) = positions.release_notes
+            && let Some(note) = &self.release_note
+        {
+            let selected = self.menu_account_index == release_idx;
+            let highlight_unread = self.release_note_unread && !selected;
+            let indicator_style = Style::default().fg(if selected || highlight_unread {
+                self.theme.accent
+            } else {
+                self.theme.text_secondary
+            });
+            let mut label_style = Style::default().fg(if selected {
+                self.theme.text_primary
+            } else if highlight_unread {
+                self.theme.accent
+            } else {
+                self.theme.text_secondary
+            });
+            if selected || highlight_unread {
+                label_style = label_style.add_modifier(Modifier::BOLD);
+            }
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if selected { ">" } else { " " }.to_string(),
+                    indicator_style,
+                ),
+                Span::raw(" "),
+                Span::styled(note.title.clone(), label_style),
+            ]));
+            let summary_style = Style::default()
+                .fg(if selected {
                     self.theme.text_primary
                 } else if highlight_unread {
                     self.theme.accent
                 } else {
                     self.theme.text_secondary
-                });
-                if selected || highlight_unread {
-                    label_style = label_style.add_modifier(Modifier::BOLD);
-                }
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        if selected { ">" } else { " " }.to_string(),
-                        indicator_style,
-                    ),
-                    Span::raw(" "),
-                    Span::styled(note.title.clone(), label_style),
-                ]));
-                let summary_style = Style::default()
-                    .fg(if selected {
-                        self.theme.text_primary
-                    } else if highlight_unread {
-                        self.theme.accent
-                    } else {
-                        self.theme.text_secondary
-                    })
-                    .add_modifier(Modifier::ITALIC);
-                lines.push(Line::from(vec![Span::styled(
-                    note.summary.clone(),
-                    summary_style,
-                )]));
-            }
+                })
+                .add_modifier(Modifier::ITALIC);
+            lines.push(Line::from(vec![Span::styled(
+                note.summary.clone(),
+                summary_style,
+            )]));
         }
         lines.push(Line::default());
         lines.push(Line::default());
@@ -14345,7 +14319,6 @@ mod tests {
     }
 
     use super::*;
-    use std::sync::{Mutex, OnceLock};
 
     fn total_width(line: &Line<'_>) -> usize {
         line.spans
@@ -14354,26 +14327,21 @@ mod tests {
             .sum()
     }
 
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
-
     #[test]
     fn resolve_current_version_respects_override() {
-        let _guard = env_guard();
-        env::set_var(CURRENT_VERSION_OVERRIDE_ENV, "1.2.3");
+        let mut env = crate::test_env::lock();
+        env.set(CURRENT_VERSION_OVERRIDE_ENV, "1.2.3");
         let version = resolve_current_version();
-        env::remove_var(CURRENT_VERSION_OVERRIDE_ENV);
+        env.remove(CURRENT_VERSION_OVERRIDE_ENV);
         assert_eq!(version, Version::parse("1.2.3").unwrap());
     }
 
     #[test]
     fn resolve_current_version_falls_back_on_invalid_override() {
-        let _guard = env_guard();
-        env::set_var(CURRENT_VERSION_OVERRIDE_ENV, "not-a-version");
+        let mut env = crate::test_env::lock();
+        env.set(CURRENT_VERSION_OVERRIDE_ENV, "not-a-version");
         let version = resolve_current_version();
-        env::remove_var(CURRENT_VERSION_OVERRIDE_ENV);
+        env.remove(CURRENT_VERSION_OVERRIDE_ENV);
         assert_eq!(version, Version::parse(crate::VERSION).unwrap());
     }
 

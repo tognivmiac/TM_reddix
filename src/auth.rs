@@ -1,15 +1,14 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
-use once_cell::sync::Lazy;
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use parking_lot::Mutex;
 use rand::RngCore;
 use reqwest::blocking::Client;
@@ -22,7 +21,7 @@ use url::Url;
 use crate::reddit::{OAuthToken, TokenProvider};
 use crate::storage::{self, Account, Token};
 
-static HTML_SUCCESS: Lazy<String> = Lazy::new(|| {
+static HTML_SUCCESS: LazyLock<String> = LazyLock::new(|| {
     r#"<!DOCTYPE html>
 <html lang="en">
   <head>

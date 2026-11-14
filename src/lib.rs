@@ -10,6 +10,8 @@ pub mod reddit;
 pub mod release_notes;
 pub mod session;
 pub mod storage;
+#[cfg(test)]
+pub(crate) mod test_env;
 pub mod theme;
 pub mod ui;
 pub mod update;

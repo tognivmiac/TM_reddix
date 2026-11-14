@@ -1,6 +1,6 @@
-use once_cell::sync::Lazy;
 use semver::Version;
 use serde::Deserialize;
+use std::sync::LazyLock;
 
 #[derive(Clone, Debug)]
 pub struct ReleaseNote {
@@ -30,7 +30,7 @@ struct RawRelease {
     url: Option<String>,
 }
 
-static NOTES: Lazy<Vec<ReleaseNote>> = Lazy::new(load_release_notes);
+static NOTES: LazyLock<Vec<ReleaseNote>> = LazyLock::new(load_release_notes);
 
 fn load_release_notes() -> Vec<ReleaseNote> {
     const RAW: &str = include_str!("../docs/release-notes.yaml");

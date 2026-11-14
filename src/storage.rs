@@ -2,10 +2,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, TimeZone, Utc};
 use parking_lot::Mutex;
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 const KEY_SHOW_NSFW: &str = "show_nsfw_posts";
 const KEY_LAST_SEEN_RELEASE: &str = "last_seen_release_version";

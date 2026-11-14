@@ -93,32 +93,32 @@ pub fn run() -> Result<()> {
                         content =
                             format!("Active account: {username}\nRemaining requests: loading...");
 
-                        if let Ok(token_provider) = manager.active_token_provider() {
-                            if let Ok(client) = reddit::Client::new(
+                        if let Ok(token_provider) = manager.active_token_provider()
+                            && let Ok(client) = reddit::Client::new(
                                 token_provider,
                                 reddit::ClientConfig {
                                     user_agent: cfg.reddit.user_agent.clone(),
                                     base_url: None,
                                     http_client: None,
                                 },
-                            ) {
-                                let client = Arc::new(client);
-                                let subreddit_api: Arc<dyn SubredditService + Send + Sync> =
-                                    Arc::new(data::RedditSubredditService::new(client.clone()));
-                                let feed_api: Arc<dyn FeedService + Send + Sync> =
-                                    Arc::new(data::RedditFeedService::new(client.clone()));
-                                let comment_api: Arc<dyn CommentService + Send + Sync> =
-                                    Arc::new(data::RedditCommentService::new(client.clone()));
-                                let interaction_api: Arc<dyn InteractionService + Send + Sync> =
-                                    Arc::new(data::RedditInteractionService::new(client.clone()));
+                            )
+                        {
+                            let client = Arc::new(client);
+                            let subreddit_api: Arc<dyn SubredditService + Send + Sync> =
+                                Arc::new(data::RedditSubredditService::new(client.clone()));
+                            let feed_api: Arc<dyn FeedService + Send + Sync> =
+                                Arc::new(data::RedditFeedService::new(client.clone()));
+                            let comment_api: Arc<dyn CommentService + Send + Sync> =
+                                Arc::new(data::RedditCommentService::new(client.clone()));
+                            let interaction_api: Arc<dyn InteractionService + Send + Sync> =
+                                Arc::new(data::RedditInteractionService::new(client.clone()));
 
-                                feed_service = Some(feed_api);
-                                subreddit_service = Some(subreddit_api);
-                                comment_service = Some(comment_api);
-                                interaction_service = Some(interaction_api);
-                                fetch_subreddits_on_start = true;
-                                posts.clear();
-                            }
+                            feed_service = Some(feed_api);
+                            subreddit_service = Some(subreddit_api);
+                            comment_service = Some(comment_api);
+                            interaction_service = Some(interaction_api);
+                            fetch_subreddits_on_start = true;
+                            posts.clear();
                         }
                     } else {
                         status = "Ready to authorize a Reddit account. Press m then a to begin."
@@ -172,14 +172,14 @@ pub fn run() -> Result<()> {
 
 fn friendly_path(path: Option<&std::path::PathBuf>) -> String {
     if let Some(path) = path {
-        if let Some(home) = dirs::home_dir() {
-            if let Ok(stripped) = path.strip_prefix(&home) {
-                let mut display = String::from("~");
-                if !stripped.as_os_str().is_empty() {
-                    display.push_str(&format!("/{}", stripped.display()));
-                }
-                return display;
+        if let Some(home) = dirs::home_dir()
+            && let Ok(stripped) = path.strip_prefix(&home)
+        {
+            let mut display = String::from("~");
+            if !stripped.as_os_str().is_empty() {
+                display.push_str(&format!("/{}", stripped.display()));
             }
+            return display;
         }
         path.display().to_string()
     } else {

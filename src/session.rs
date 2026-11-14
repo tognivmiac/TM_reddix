@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use parking_lot::RwLock;
 
 use crate::auth::{AuthorizationRequest, Flow as AuthFlow, Session as AuthSession};

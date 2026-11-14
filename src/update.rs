@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use semver::Version;
 
 pub const SKIP_UPDATE_ENV: &str = "REDDIX_SKIP_UPDATE_CHECK";
@@ -196,34 +196,29 @@ fn replace_executable(built: &Path, target: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn guard_env() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
+    use crate::test_env;
 
     #[test]
     fn forced_update_returns_info_when_version_is_newer() {
-        let _guard = guard_env();
-        env::set_var(FORCE_VERSION_ENV, "0.2.1");
-        env::set_var(FORCE_URL_ENV, "https://example.com/releases/0.2.1");
+        let mut env = test_env::lock();
+        env.set(FORCE_VERSION_ENV, "0.2.1");
+        env.set(FORCE_URL_ENV, "https://example.com/releases/0.2.1");
         let current = Version::parse("0.1.0").unwrap();
         let info = forced_update(&current).unwrap().unwrap();
         assert_eq!(info.version, Version::parse("0.2.1").unwrap());
         assert_eq!(info.release_url, "https://example.com/releases/0.2.1");
         assert_eq!(info.tag, "v0.2.1");
-        env::remove_var(FORCE_VERSION_ENV);
-        env::remove_var(FORCE_URL_ENV);
+        env.remove(FORCE_VERSION_ENV);
+        env.remove(FORCE_URL_ENV);
     }
 
     #[test]
     fn forced_update_is_ignored_when_version_not_newer() {
-        let _guard = guard_env();
-        env::set_var(FORCE_VERSION_ENV, "0.1.0");
+        let mut env = test_env::lock();
+        env.set(FORCE_VERSION_ENV, "0.1.0");
         let current = Version::parse("0.1.0").unwrap();
         assert!(forced_update(&current).unwrap().is_none());
-        env::remove_var(FORCE_VERSION_ENV);
+        env.remove(FORCE_VERSION_ENV);
     }
 
     #[test]
@@ -257,14 +252,14 @@ version = "1.0.0"
 
     #[test]
     fn check_compares_against_source_checkout() {
-        let _guard = guard_env();
+        let mut env = test_env::lock();
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("Cargo.toml"),
             "[package]\nname = \"reddix\"\nversion = \"0.2.9+tm.2\"\n",
         )
         .unwrap();
-        env::set_var(SOURCE_DIR_ENV, dir.path());
+        env.set(SOURCE_DIR_ENV, dir.path());
 
         let older = Version::parse("0.2.9+tm.1").unwrap();
         let info = check_for_update(&older).unwrap().unwrap();
@@ -275,8 +270,8 @@ version = "1.0.0"
         assert!(check_for_update(&same).unwrap().is_none());
 
         // A missing checkout is not an error; there is just nothing newer.
-        env::set_var(SOURCE_DIR_ENV, dir.path().join("missing"));
+        env.set(SOURCE_DIR_ENV, dir.path().join("missing"));
         assert!(check_for_update(&older).unwrap().is_none());
-        env::remove_var(SOURCE_DIR_ENV);
+        env.remove(SOURCE_DIR_ENV);
     }
 }

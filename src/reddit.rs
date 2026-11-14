@@ -1,10 +1,10 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{anyhow, bail, Context, Result};
-use reqwest::blocking::{Client as HttpClient, Response};
-use reqwest::header::{HeaderMap, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
+use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Method;
+use reqwest::blocking::{Client as HttpClient, Response};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, USER_AGENT};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{self, Value};
@@ -294,10 +294,10 @@ impl Client {
 
     pub fn save(&self, fullname: &str, category: Option<&str>) -> Result<()> {
         let mut form = vec![("id".to_string(), fullname.to_string())];
-        if let Some(cat) = category {
-            if !cat.is_empty() {
-                form.push(("category".into(), cat.into()));
-            }
+        if let Some(cat) = category
+            && !cat.is_empty()
+        {
+            form.push(("category".into(), cat.into()));
         }
         self.request(Method::POST, "/api/save", &[], Some(form))?;
         Ok(())

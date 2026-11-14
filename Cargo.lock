@@ -1724,7 +1724,6 @@ dependencies = [
  "humantime-serde",
  "image",
  "libc",
- "once_cell",
  "parking_lot",
  "percent-encoding",
  "predicates",
